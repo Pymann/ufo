@@ -1,0 +1,233 @@
+# ufo.pack — git packfiles (pack v2) and their indexes (idx v2).
+#
+#   pack:  "PACK" | be32 version=2 | be32 count | entries… | sha1(all before)
+#   entry: type+size varint header (type 1 commit, 2 tree, 3 blob, 4 tag,
+#          6 ofs-delta, 7 ref-delta), [base reference], zlib(body or delta)
+#   idx:   ff 74 4f 63 | be32 2 | 256×be32 fan-out | N×20 ids (sorted) |
+#          N×be32 crc32 | N×be32 offset (MSB → 64-bit table) | 64-bit offsets |
+#          pack sha1 | idx sha1
+#
+# PackSet reads (the packs of a repository, or one pack while indexing it);
+# PackBuilder writes a pack; index_pack builds the .idx for a received pack,
+# like `git index-pack`.  Packs are read into memory whole (prototype limit).
+
+- namespace: ufo.pack
+
+- import: "object.aiml"
+
+- model:
+    name: Entry
+    fields:
+      - [valid, i32, 0]
+      - [kind, i32, 0]          # 1..4 objects, 6 ofs-delta, 7 ref-delta
+      - [size, i64, 0]          # size of the inflated data (body or delta)
+      - [data_off, i64, 0]      # where the zlib stream starts
+      - [base_off, i64, -1]     # ofs-delta: absolute offset of the base
+      - [base_oid, string, ""]  # ref-delta: id of the base
+
+- def:
+    name: kind_name
+    args: [[kind, i32]]
+    return: string
+    body:
+      - if: { condition: { eq: [kind, 1] }, then: [{ return: ["commit"] }] }
+      - if: { condition: { eq: [kind, 2] }, then: [{ return: ["tree"] }] }
+      - if: { condition: { eq: [kind, 3] }, then: [{ return: ["blob"] }] }
+      - if: { condition: { eq: [kind, 4] }, then: [{ return: ["tag"] }] }
+      - return: [""]
+
+- def:
+    name: kind_code
+    static_off: ["str_cmp"]
+    args: [[name, string]]
+    return: i32
+    body:
+      - if: { condition: { eq: [name, "commit"] }, then: [{ return: [1] }] }
+      - if: { condition: { eq: [name, "tree"] }, then: [{ return: [2] }] }
+      - if: { condition: { eq: [name, "blob"] }, then: [{ return: [3] }] }
+      - if: { condition: { eq: [name, "tag"] }, then: [{ return: [4] }] }
+      - return: [0]
+
+# Entry header at `offset` of a pack held in `data`.
+- def:
+    name: parse_entry
+    args: [[data, buffer<u8>], [offset, i64]]
+    return: ufo.pack.Entry
+    body:
+      - decl: [ent, ufo.pack.Entry]
+      - decl: [pos, i64, offset]
+      - decl: [byte, i32, { call: [bytes.u8, data, pos] }]
+      - if: { condition: { lt: [byte, 0] }, then: [{ return: [ent] }] }
+      - set: [ent.kind, { band: [{ shr: [byte, 4] }, 7] }]
+      - decl: [size, i64, { band: [byte, 15] }]
+      - decl: [shift, i64, 4]
+      - set: [pos, { +: [pos, 1] }]
+      - while:
+          condition: { ge: [byte, 128] }
+          body:
+            - set: [byte, { call: [bytes.u8, data, pos] }]
+            - if: { condition: { lt: [byte, 0] }, then: [{ return: [ent] }] }
+            - set: [size, { bor: [size, { shl: [{ band: [byte, 127] }, shift] }] }]
+            - set: [shift, { +: [shift, 7] }]
+            - set: [pos, { +: [pos, 1] }]
+      - set: [ent.size, size]
+      - if:
+          condition: { eq: [ent.kind, 6] }
+          then:
+            # offset encoding: big-endian 7-bit groups, each continuation adds 1
+            - set: [byte, { call: [bytes.u8, data, pos] }]
+            - set: [pos, { +: [pos, 1] }]
+            - decl: [back, i64, { band: [byte, 127] }]
+            - while:
+                condition: { ge: [byte, 128] }
+                body:
+                  - set: [byte, { call: [bytes.u8, data, pos] }]
+                  - if: { condition: { lt: [byte, 0] }, then: [{ return: [ent] }] }
+                  - set: [pos, { +: [pos, 1] }]
+                  - set: [back, { +: [{ shl: [{ +: [back, 1] }, 7] }, { band: [byte, 127] }] }]
+            - set: [ent.base_off, { -: [offset, back] }]
+      - if:
+          condition: { eq: [ent.kind, 7] }
+          then:
+            - set: [ent.base_oid, { call: [bytes.to_hex, data, pos, 20] }]
+            - set: [pos, { +: [pos, 20] }]
+      - set: [ent.data_off, pos]
+      - if:
+          condition: { or: [{ and: [{ ge: [ent.kind, 1] }, { le: [ent.kind, 4] }] }, { or: [{ eq: [ent.kind, 6] }, { eq: [ent.kind, 7] }] }] }
+          then:
+            - set: [ent.valid, 1]
+      - return: [ent]
+
+- class:
+    name: PackSet
+    members:
+      - [bases, list<string>, null, { access: public }]
+      - [indexes, list<buffer<u8>>]
+      - [datas, list<buffer<u8>>]
+    methods:
+      # Adds <base>.pack + <base>.idx.  Returns 0 or -1 (missing/invalid).
+      - def:
+          name: add
+          args: [[base, string]]
+          return: i32
+          body:
+            - decl: [idx_data, buffer<u8>, { call: [bytes.read_file, "${base}.idx"] }]
+            - if: { condition: { lt: [idx_data.len, 1072] }, then: [{ return: [-1] }] }
+            - if: { condition: { neq: [{ call: [bytes.to_hex, idx_data, 0, 8] }, "ff744f6300000002"] }, then: [{ return: [-1] }] }
+            - decl: [pack_data, buffer<u8>, { call: [bytes.read_file, "${base}.pack"] }]
+            - if: { condition: { neq: [{ call: [bytes.text, pack_data, 0, 4] }, "PACK"] }, then: [{ return: [-1] }] }
+            - call: [<.bases.push, base]
+            - call: [<.indexes.push, idx_data]
+            - call: [<.datas.push, pack_data]
+            - return: [0]
+
+      - def:
+          name: count
+          return: i32
+          body:
+            - return: [<.bases.len]
+
+      # Offset of `oid` in pack `pno`, or -1.
+      - def:
+          name: find_offset
+          args: [[pno, i32], [oid, string]]
+          return: i64
+          body:
+            - decl: [idx_data, buffer<u8>, { call: [<.indexes.get, pno] }]
+            - decl: [want, buffer<u8>, { call: [bytes.from_hex, oid] }]
+            - if: { condition: { neq: [want.len, 20] }, then: [{ return: [-1] }] }
+            - decl: [first, i32, { call: [bytes.u8, want, 0] }]
+            - decl: [low, i64, 0]
+            - if: { condition: { gt: [first, 0] }, then: [{ set: [low, { call: [bytes.be32, idx_data, { +: [8, { '*': [{ -: [first, 1] }, 4] }] }] }] }] }
+            - decl: [high, i64, { call: [bytes.be32, idx_data, { +: [8, { '*': [first, 4] }] }] }]
+            - decl: [total, i64, { call: [bytes.be32, idx_data, 1028] }]
+            - while:
+                condition: { lt: [low, high] }
+                body:
+                  - decl: [mid, i64, { '/': [{ +: [low, high] }, 2] }]
+                  - decl: [order, i32, { call: [bytes.compare, idx_data, { +: [1032, { '*': [mid, 20] }] }, want, 0, 20] }]
+                  - if:
+                      condition: { eq: [order, 0] }
+                      then:
+                        - decl: [off_pos, i64, { +: [{ +: [1032, { '*': [total, 24] }] }, { '*': [mid, 4] }] }]
+                        - decl: [small, i64, { call: [bytes.be32, idx_data, off_pos] }]
+                        - if: { condition: { lt: [small, 2147483648] }, then: [{ return: [small] }] }
+                        - decl: [large_pos, i64, { +: [{ +: [1032, { '*': [total, 28] }] }, { '*': [{ -: [small, 2147483648] }, 8] }] }]
+                        - return: [{ +: [{ shl: [{ call: [bytes.be32, idx_data, large_pos] }, 32] }, { call: [bytes.be32, idx_data, { +: [large_pos, 4] }] }] }]
+                  - if:
+                      condition: { lt: [order, 0] }
+                      then: [{ set: [low, { +: [mid, 1] }] }]
+                      else: [{ set: [high, mid] }]
+            - return: [-1]
+
+      # All object ids in pack `pno` (index order).
+      - def:
+          name: ids
+          args: [[pno, i32]]
+          return: list<string>
+          body:
+            - decl: [out, list<string>]
+            - decl: [idx_data, buffer<u8>, { call: [<.indexes.get, pno] }]
+            - decl: [total, i64, { call: [bytes.be32, idx_data, 1028] }]
+            - decl: [num, i64, 0]
+            - while:
+                condition: { lt: [num, total] }
+                body:
+                  - call: [out.push, { call: [bytes.to_hex, idx_data, { +: [1032, { '*': [num, 20] }] }, 20] }]
+                  - set: [num, { +: [num, 1] }]
+            - return: [out]
+
+      - def:
+          name: has
+          args: [[oid, string]]
+          return: i32
+          body:
+            - decl: [pno, i32, 0]
+            - while:
+                condition: { lt: [pno, <.bases.len] }
+                body:
+                  - if: { condition: { ge: [{ call: [<.find_offset, pno, oid] }, 0] }, then: [{ return: [1] }] }
+                  - set: [pno, { +: [pno, 1] }]
+            - return: [0]
+
+      # Raw object ("<kind> <size>\0<body>") for `oid`, empty when not in any pack.
+      - def:
+          name: read
+          args: [[oid, string]]
+          return: buffer<u8>
+          body:
+            - decl: [pno, i32, 0]
+            - while:
+                condition: { lt: [pno, <.bases.len] }
+                body:
+                  - decl: [offset, i64, { call: [<.find_offset, pno, oid] }]
+                  - if: { condition: { ge: [offset, 0] }, then: [{ return: [{ call: [<.read_at, pno, offset] }] }] }
+                  - set: [pno, { +: [pno, 1] }]
+            - return: [{ call: [bytes.from_string, ""] }]
+
+      # Raw object at `offset` of pack `pno`, deltas resolved.
+      - def:
+          name: read_at
+          args: [[pno, i32], [offset, i64]]
+          return: buffer<u8>
+          body:
+            - decl: [data, buffer<u8>, { call: [<.datas.get, pno] }]
+            - decl: [ent, ufo.pack.Entry, { call: [ufo.pack.parse_entry, data, offset] }]
+            - decl: [empty, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - if: { condition: { eq: [ent.valid, 0] }, then: [{ return: [empty] }] }
+            - decl: [inflated, buffer<u8>, { call: [bytes.zlib_at, data, ent.data_off] }]
+            - if: { condition: { neq: [inflated.len, ent.size] }, then: [{ return: [empty] }] }
+            - if:
+                condition: { le: [ent.kind, 4] }
+                then:
+                  - return: [{ call: [ufo.object.frame, { call: [ufo.pack.kind_name, ent.kind] }, inflated] }]
+            - decl: [base_raw, buffer<u8>]
+            - if:
+                condition: { eq: [ent.kind, 6] }
+                then: [{ set: [base_raw, { call: [<.read_at, pno, ent.base_off] }] }]
+                else: [{ set: [base_raw, { call: [<.read, ent.base_oid] }] }]
+            - if: { condition: { eq: [base_raw.len, 0] }, then: [{ return: [empty] }] }
+            - decl: [base_body, buffer<u8>, { call: [ufo.object.body_of, base_raw] }]
+            - decl: [patched, buffer<u8>, { call: [bytes.delta_apply, base_body, inflated] }]
+            - if: { condition: { and: [{ eq: [patched.len, 0] }, { gt: [inflated.len, 4] }] }, then: [{ return: [empty] }] }
+            - return: [{ call: [ufo.object.frame, { call: [ufo.object.kind_of, base_raw] }, patched] }]

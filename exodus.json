@@ -1,0 +1,40 @@
+{
+    "$schema": "exodus.project.config-1.0",
+    "name": "ufo",
+    "version": "0.1.0",
+    "license": [
+        "MIT"
+    ],
+    "output_type": "executable",
+    "sources": [
+        "ufo.aiml"
+    ],
+    "compiler": {
+        "name": "../aiml/out/aiml/aiml",
+        "lang_standard": "17",
+        "flags": []
+    },
+    "linker": {
+        "name": "g++",
+        "flags": [
+            "-Wl,-rpath,../aiml/out/libaiml"
+        ],
+        "libraries": [
+            "aiml",
+            "pthread",
+            "ssl",
+            "crypto",
+            "dl"
+        ],
+        "library_paths": [
+            "../aiml/out/libaiml"
+        ]
+    },
+    "artifact_in_cwd": true,
+    "optimization": "2",
+    "debug": false,
+    "warnings": [],
+    "env": {
+        "AIML_MEM_V3": "1"
+    }
+}

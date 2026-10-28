@@ -1,0 +1,521 @@
+# ufo.repo — a git repository on disk: objects and refs, in git's own layout,
+# so `git log`, `git fsck` and every git server read what ufo writes.
+#
+#   <git_dir>/HEAD                 "ref: refs/heads/main\n"
+#   <git_dir>/objects/aa/bbbb…     zlib("<kind> <size>\0<body>")
+#   <git_dir>/objects/pack/*.pack  packfiles (+ .idx), read via ufo.pack
+#   <git_dir>/refs/…               one file per ref ("<oid>\n")
+#   <git_dir>/packed-refs          "<oid> <name>" lines (read; ufo writes loose refs)
+#
+# Writes are atomic: a temp file in the same directory, then rename.
+
+- namespace: ufo.repo
+
+- import: "object.aiml"
+- import: "pack.aiml"
+
+# Directory part of a path ("a/b/c" → "a/b").
+- def:
+    name: dirname
+    args: [[file_path, string]]
+    return: string
+    body:
+      - decl: [parts, list<string>, { call: [file_path.split, "/"] }]
+      - decl: [out, string, ""]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, { -: [parts.len, 1] }] }
+          body:
+            - if: { condition: { gt: [idx, 0] }, then: [{ set: [out, "${out}/"] }] }
+            - set: [out, "${out}${{ call: [parts.get, idx] }}"]
+            - set: [idx, { +: [idx, 1] }]
+      - return: [out]
+
+- model:
+    name: RefEntry
+    fields:
+      - [name, string, ""]
+      - [oid, string, ""]
+
+- class:
+    name: Repository
+    members:
+      - [git_dir, string, "", { access: public }]
+      - [packs, ptr<ufo.pack.PackSet>, null]
+      - [packs_loaded, i32, 0]
+      - [scanned, list<ufo.repo.RefEntry>]
+    methods:
+      # Opens <path>/.git, or <path> itself when it is a bare repository.
+      # Returns 1 when a repository is there.
+      - def:
+          name: open
+          args: [[path, string]]
+          return: i32
+          body:
+            - if:
+                condition: { call: [io.is_dir, "${path}/.git/objects"] }
+                then:
+                  - set: [<.git_dir, "${path}/.git"]
+                  - return: [1]
+            - if:
+                condition: { call: [io.is_dir, "${path}/objects"] }
+                then:
+                  - set: [<.git_dir, path]
+                  - return: [1]
+            - return: [0]
+
+      # Creates a repository (`bare` = 1: <path> is the git dir).
+      - def:
+          name: create
+          args: [[path, string], [bare, i32], [branch, string]]
+          return: i32
+          body:
+            - decl: [gdir, string, "${path}/.git"]
+            - if: { condition: { eq: [bare, 1] }, then: [{ set: [gdir, path] }] }
+            - set: [<.git_dir, gdir]
+            - call: [io.mkdir_all, "${gdir}/objects/pack"]
+            - call: [io.mkdir_all, "${gdir}/objects/info"]
+            - call: [io.mkdir_all, "${gdir}/refs/heads"]
+            - call: [io.mkdir_all, "${gdir}/refs/tags"]
+            - if:
+                condition: { not: [{ call: [io.exists, "${gdir}/HEAD"] }] }
+                then:
+                  - call: [<.write_text, "${gdir}/HEAD", "ref: refs/heads/${branch}\n"]
+            - decl: [bare_txt, string, "false"]
+            - if: { condition: { eq: [bare, 1] }, then: [{ set: [bare_txt, "true"] }] }
+            - if:
+                condition: { not: [{ call: [io.exists, "${gdir}/config"] }] }
+                then:
+                  - call: [<.write_text, "${gdir}/config", "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = ${bare_txt}\n"]
+            - return: [1]
+
+      - def:
+          name: write_text
+          args: [[file_path, string], [content, string]]
+          return: i32
+          body:
+            - decl: [stage, string, "${file_path}.ufo-${{ call: [math.random_hex, 4] }}.tmp"]
+            - if:
+                condition: { neq: [{ call: [io.write_file, stage, content] }, 0] }
+                then:
+                  - return: [-1]
+            - call: [io.rename, stage, file_path]
+            - return: [0]
+
+      # ── objects ──────────────────────────────────────────────────────────
+      - def:
+          name: loose_path
+          args: [[oid, string]]
+          return: string
+          body:
+            - return: ["${<.git_dir}/objects/${{ call: [oid.substr, 0, 2] }}/${{ call: [oid.substr, 2] }}"]
+
+      # Stores a raw object ("<kind> <size>\0<body>"); returns its id.
+      - def:
+          name: write_raw
+          args: [[raw, buffer<u8>]]
+          return: string
+          body:
+            - decl: [oid, string, { call: [ufo.object.id_of, raw] }]
+            - if:
+                condition: { eq: [{ call: [<.has, oid] }, 1] }
+                then:
+                  - return: [oid]
+            - decl: [dest, string, { call: [<.loose_path, oid] }]
+            - call: [io.mkdir_all, "${<.git_dir}/objects/${{ call: [oid.substr, 0, 2] }}"]
+            - decl: [packed, buffer<u8>, { call: [bytes.zlib, raw] }]
+            - decl: [stage, string, "${dest}.ufo-${{ call: [math.random_hex, 4] }}.tmp"]
+            - if:
+                condition: { neq: [{ call: [io.write_file, stage, packed] }, 0] }
+                then:
+                  - return: [""]
+            - call: [io.rename, stage, dest]
+            - return: [oid]
+
+      - def:
+          name: write_object
+          args: [[kind, string], [body, buffer<u8>]]
+          return: string
+          body:
+            - return: [{ call: [<.write_raw, { call: [ufo.object.frame, kind, body] }] }]
+
+      - def:
+          name: load_packs
+          body:
+            - if: { condition: { eq: [<.packs_loaded, 1] }, then: [{ return: [] }] }
+            - set: [<.packs_loaded, 1]
+            - decl: [fresh, ptr<ufo.pack.PackSet>, { new: ufo.pack.PackSet }]
+            - decl: [pack_dir, string, "${<.git_dir}/objects/pack"]
+            - if:
+                condition: { call: [io.is_dir, pack_dir] }
+                then:
+                  - decl: [names, list<string>]
+                  - decl: [entries, list<path>, { call: [io.list_dir, pack_dir] }]
+                  - decl: [idx, i32, 0]
+                  - while:
+                      condition: { lt: [idx, entries.len] }
+                      body:
+                        - decl: [entry, path, { call: [entries.get, idx] }]
+                        - decl: [fname, string, { call: [entry.name] }]
+                        - if:
+                            condition: { eq: [{ call: [fname.ends_with, ".idx"] }, 1] }
+                            then:
+                              - call: [names.push, "${pack_dir}/${{ call: [fname.substr, 0, { -: [fname.len, 4] }] }}"]
+                        - set: [idx, { +: [idx, 1] }]
+                  - call: [names.sort]
+                  - decl: [ndx, i32, 0]
+                  - while:
+                      condition: { lt: [ndx, names.len] }
+                      body:
+                        - call: [fresh.add, { call: [names.get, ndx] }]
+                        - set: [ndx, { +: [ndx, 1] }]
+            - set: [<.packs, fresh]
+
+      # Forgets the loaded packs (after a fetch added one).
+      - def:
+          name: rescan
+          body:
+            - set: [<.packs_loaded, 0]
+
+      - def:
+          name: has
+          args: [[oid, string]]
+          return: i32
+          body:
+            - if: { condition: { neq: [oid.len, 40] }, then: [{ return: [0] }] }
+            - if: { condition: { call: [io.exists, { call: [<.loose_path, oid] }] }, then: [{ return: [1] }] }
+            - call: [<.load_packs]
+            - return: [{ call: [<.packs.has, oid] }]
+
+      # Raw object ("<kind> <size>\0<body>"), empty when unknown.
+      - def:
+          name: read_raw
+          args: [[oid, string]]
+          return: buffer<u8>
+          body:
+            - decl: [loose, string, { call: [<.loose_path, oid] }]
+            - if:
+                condition: { and: [{ eq: [oid.len, 40] }, { call: [io.exists, loose] }] }
+                then:
+                  - decl: [packed, buffer<u8>, { call: [bytes.read_file, loose] }]
+                  - return: [{ call: [bytes.zlib_at, packed, 0] }]
+            - call: [<.load_packs]
+            - return: [{ call: [<.packs.read, oid] }]
+
+      - def:
+          name: kind
+          args: [[oid, string]]
+          return: string
+          body:
+            - return: [{ call: [ufo.object.kind_of, { call: [<.read_raw, oid] }] }]
+
+      - def:
+          name: read_body
+          args: [[oid, string]]
+          return: buffer<u8>
+          body:
+            - return: [{ call: [ufo.object.body_of, { call: [<.read_raw, oid] }] }]
+
+      - def:
+          name: read_commit
+          args: [[oid, string]]
+          return: ufo.object.Commit
+          body:
+            - return: [{ call: [ufo.object.commit_decode, { call: [<.read_body, oid] }] }]
+
+      - def:
+          name: read_tree
+          args: [[oid, string]]
+          return: list<ufo.object.TreeEntry>
+          body:
+            - return: [{ call: [ufo.object.tree_decode, { call: [<.read_body, oid] }] }]
+
+      # ── refs ─────────────────────────────────────────────────────────────
+      # The ref HEAD points at ("refs/heads/main"), or "" when HEAD is detached.
+      - def:
+          name: head_ref
+          return: string
+          body:
+            - decl: [raw, string, { call: [io.read_file, "${<.git_dir}/HEAD"] }]
+            - decl: [line, string, { call: [raw.trim] }]
+            - if:
+                condition: { eq: [{ call: [line.starts_with, "ref: "] }, 1] }
+                then:
+                  - return: [{ call: [line.substr, 5] }]
+            - return: [""]
+
+      # Object id of a ref name, "HEAD", or a full id; "" when unknown.
+      - def:
+          name: resolve
+          static_off: ["str_cmp"]
+          args: [[name, string]]
+          return: string
+          body:
+            - if:
+                condition: { and: [{ eq: [name.len, 40] }, { eq: [{ call: [<.has, name] }, 1] }] }
+                then:
+                  - return: [name]
+            - decl: [target, string, name]
+            - if:
+                condition: { eq: [name, "HEAD"] }
+                then:
+                  - decl: [raw, string, { call: [io.read_file, "${<.git_dir}/HEAD"] }]
+                  - decl: [line, string, { call: [raw.trim] }]
+                  - if:
+                      condition: { eq: [{ call: [line.starts_with, "ref: "] }, 0] }
+                      then:
+                        - return: [line]
+                  - set: [target, { call: [line.substr, 5] }]
+            - decl: [loose, string, "${<.git_dir}/${target}"]
+            - if:
+                condition: { call: [io.is_file, loose] }
+                then:
+                  - decl: [content, string, { call: [io.read_file, loose] }]
+                  - decl: [oid, string, { call: [content.trim] }]
+                  - if:
+                      condition: { eq: [{ call: [oid.starts_with, "ref: "] }, 1] }
+                      then:
+                        - return: [{ call: [<.resolve, { call: [oid.substr, 5] }] }]
+                  - return: [oid]
+            - decl: [packed, string, { call: [<.packed_ref, target] }]
+            - if: { condition: { eq: [packed.len, 40] }, then: [{ return: [packed] }] }
+            # short names: main → refs/heads/main, v1 → refs/tags/v1
+            - if:
+                condition: { eq: [{ call: [name.starts_with, "refs/"] }, 0] }
+                then:
+                  - if: { condition: { neq: [name, "HEAD"] }, then: [{ return: [{ call: [<.resolve_full, name] }] }] }
+            - return: [""]
+
+      # git revision syntax: <name>[~N | ^ | ^N]…[:<path>]  ("HEAD~3:dir/file").
+      - def:
+          name: rev
+          static_off: ["str_cmp"]
+          args: [[spec, string]]
+          return: string
+          body:
+            - decl: [colon, i32, { call: [spec.index_of, ":"] }]
+            - if:
+                condition: { ge: [colon, 0] }
+                then:
+                  - decl: [left, string, { call: [spec.substr, 0, colon] }]
+                  - if: { condition: { eq: [left.len, 0] }, then: [{ set: [left, "HEAD"] }] }
+                  - decl: [start, string, { call: [<.rev, left] }]
+                  - if: { condition: { eq: [start.len, 0] }, then: [{ return: [""] }] }
+                  - return: [{ call: [<.at_path, start, { call: [spec.substr, { +: [colon, 1] }] }] }]
+            # split off the first ~ or ^
+            - decl: [cut, i32, -1]
+            - decl: [tilde, i32, { call: [spec.index_of, "~"] }]
+            - decl: [caret, i32, { call: [spec.index_of, "^"] }]
+            - set: [cut, tilde]
+            - if: { condition: { or: [{ lt: [cut, 0] }, { and: [{ ge: [caret, 0] }, { lt: [caret, cut] }] }] }, then: [{ set: [cut, caret] }] }
+            - if: { condition: { lt: [cut, 0] }, then: [{ return: [{ call: [<.resolve, spec] }] }] }
+            - decl: [oid, string, { call: [<.resolve, { call: [spec.substr, 0, cut] }] }]
+            - decl: [rest, string, { call: [spec.substr, cut] }]
+            - while:
+                condition: { and: [{ gt: [rest.len, 0] }, { eq: [oid.len, 40] }] }
+                body:
+                  - decl: [oper, string, { call: [rest.substr, 0, 1] }]
+                  - set: [rest, { call: [rest.substr, 1] }]
+                  - decl: [digits, string, ""]
+                  - decl: [numerals, string, "0123456789"]
+                  - decl: [scanning, i32, 1]
+                  - while:
+                      condition: { and: [{ eq: [scanning, 1] }, { gt: [rest.len, 0] }] }
+                      body:
+                        - decl: [digit, string, { call: [rest.substr, 0, 1] }]
+                        - if:
+                            condition: { ge: [{ call: [numerals.index_of, digit] }, 0] }
+                            then:
+                              - set: [digits, "${digits}${digit}"]
+                              - set: [rest, { call: [rest.substr, 1] }]
+                            else: [{ set: [scanning, 0] }]
+                  - decl: [count, i32, 1]
+                  - if: { condition: { gt: [digits.len, 0] }, then: [{ set: [count, { call: [digits.to_int] }] }] }
+                  - decl: [cmt, ufo.object.Commit]
+                  - if:
+                      condition: { eq: [oper, "~"] }
+                      then:
+                        - decl: [step, i32, 0]
+                        - while:
+                            condition: { and: [{ lt: [step, count] }, { eq: [oid.len, 40] }] }
+                            body:
+                              - set: [cmt, { call: [<.read_commit, oid] }]
+                              - if:
+                                  condition: { eq: [cmt.parents.len, 0] }
+                                  then: [{ set: [oid, ""] }]
+                                  else: [{ set: [oid, { call: [cmt.parents.get, 0] }] }]
+                              - set: [step, { +: [step, 1] }]
+                      else:
+                        - if:
+                            condition: { gt: [count, 0] }
+                            then:
+                              - set: [cmt, { call: [<.read_commit, oid] }]
+                              - if:
+                                  condition: { lt: [cmt.parents.len, count] }
+                                  then: [{ set: [oid, ""] }]
+                                  else: [{ set: [oid, { call: [cmt.parents.get, { -: [count, 1] }] }] }]
+            - return: [oid]
+
+      # Object at `rel_path` below a commit or tree ("" when absent).
+      - def:
+          name: at_path
+          args: [[start, string], [rel_path, string]]
+          return: string
+          body:
+            - decl: [oid, string, start]
+            - if:
+                condition: { eq: [{ call: [<.kind, oid] }, "commit"] }
+                then:
+                  - decl: [cmt, ufo.object.Commit, { call: [<.read_commit, oid] }]
+                  - set: [oid, cmt.tree]
+            - if: { condition: { eq: [rel_path.len, 0] }, then: [{ return: [oid] }] }
+            - decl: [parts, list<string>, { call: [rel_path.split, "/"] }]
+            - decl: [pdx, i32, 0]
+            - while:
+                condition: { and: [{ lt: [pdx, parts.len] }, { eq: [oid.len, 40] }] }
+                body:
+                  - decl: [want, string, { call: [parts.get, pdx] }]
+                  - set: [pdx, { +: [pdx, 1] }]
+                  - decl: [entries, list<ufo.object.TreeEntry>, { call: [<.read_tree, oid] }]
+                  - decl: [found, string, ""]
+                  - decl: [edx, i32, 0]
+                  - while:
+                      condition: { lt: [edx, entries.len] }
+                      body:
+                        - decl: [ent, ufo.object.TreeEntry, { at: [entries, edx] }]
+                        - if: { condition: { eq: [ent.name, want] }, then: [{ set: [found, ent.oid] }] }
+                        - set: [edx, { +: [edx, 1] }]
+                  - set: [oid, found]
+            - return: [oid]
+
+      - def:
+          name: resolve_full
+          args: [[short, string]]
+          return: string
+          body:
+            - decl: [heads, string, { call: [<.resolve, "refs/heads/${short}"] }]
+            - if: { condition: { gt: [heads.len, 0] }, then: [{ return: [heads] }] }
+            - return: [{ call: [<.resolve, "refs/tags/${short}"] }]
+
+      - def:
+          name: packed_refs
+          return: list<ufo.repo.RefEntry>
+          body:
+            - decl: [out, list<ufo.repo.RefEntry>]
+            - decl: [file_path, string, "${<.git_dir}/packed-refs"]
+            - if: { condition: { not: [{ call: [io.is_file, file_path] }] }, then: [{ return: [out] }] }
+            - decl: [raw, string, { call: [io.read_file, file_path] }]
+            - decl: [lines, list<string>, { call: [raw.split, "\n"] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, lines.len] }
+                body:
+                  - decl: [line, string, { call: [lines.get, idx] }]
+                  - if:
+                      condition: { and: [{ gt: [line.len, 41] }, { and: [{ eq: [{ call: [line.starts_with, "#"] }, 0] }, { eq: [{ call: [line.starts_with, "^"] }, 0] }] }] }
+                      then:
+                        - decl: [ent, ufo.repo.RefEntry]
+                        - set: [ent.name, { call: [line.substr, 41] }]
+                        - set: [ent.oid, { call: [line.substr, 0, 40] }]
+                        - call: [out.push, ent]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [out]
+
+      - def:
+          name: packed_ref
+          args: [[name, string]]
+          return: string
+          body:
+            - decl: [all, list<ufo.repo.RefEntry>, { call: [<.packed_refs] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, all.len] }
+                body:
+                  - decl: [ent, ufo.repo.RefEntry, { at: [all, idx] }]
+                  - if: { condition: { eq: [ent.name, name] }, then: [{ return: [ent.oid] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [""]
+
+      # Points `name` (e.g. "refs/heads/main") at `oid`.
+      - def:
+          name: update_ref
+          args: [[name, string], [oid, string]]
+          return: i32
+          body:
+            - decl: [file_path, string, "${<.git_dir}/${name}"]
+            - call: [io.mkdir_all, { call: [ufo.repo.dirname, file_path] }]
+            - return: [{ call: [<.write_text, file_path, "${oid}\n"] }]
+
+      # All refs below `prefix` ("refs/" = every ref); a loose ref wins over a
+      # packed one of the same name.  Sorted by name.
+      - def:
+          name: list_refs
+          args: [[prefix, string]]
+          return: list<ufo.repo.RefEntry>
+          body:
+            - decl: [fresh, list<ufo.repo.RefEntry>]
+            - set: [<.scanned, fresh]
+            - call: [<.scan_refs, "refs", prefix]
+            - decl: [names, list<string>]
+            - decl: [by_name, map<string:string>]
+            - decl: [ldx, i32, 0]
+            - while:
+                condition: { lt: [ldx, <.scanned.len] }
+                body:
+                  - decl: [loose, ufo.repo.RefEntry, { at: [<.scanned, ldx] }]
+                  - call: [names.push, loose.name]
+                  - call: [by_name.put, loose.name, loose.oid]
+                  - set: [ldx, { +: [ldx, 1] }]
+            - decl: [packed, list<ufo.repo.RefEntry>, { call: [<.packed_refs] }]
+            - decl: [pdx, i32, 0]
+            - while:
+                condition: { lt: [pdx, packed.len] }
+                body:
+                  - decl: [one, ufo.repo.RefEntry, { at: [packed, pdx] }]
+                  - if:
+                      condition: { and: [{ eq: [{ call: [one.name.starts_with, prefix] }, 1] }, { eq: [{ call: [by_name.contains, one.name] }, 0] }] }
+                      then:
+                        - call: [names.push, one.name]
+                        - call: [by_name.put, one.name, one.oid]
+                  - set: [pdx, { +: [pdx, 1] }]
+            - call: [names.sort]
+            - decl: [out, list<ufo.repo.RefEntry>]
+            - decl: [ndx, i32, 0]
+            - while:
+                condition: { lt: [ndx, names.len] }
+                body:
+                  - decl: [ent, ufo.repo.RefEntry]
+                  - set: [ent.name, { call: [names.get, ndx] }]
+                  - set: [ent.oid, { call: [by_name.get, ent.name] }]
+                  - call: [out.push, ent]
+                  - set: [ndx, { +: [ndx, 1] }]
+            - return: [out]
+
+      - def:
+          name: scan_refs
+          args: [[rel, string], [prefix, string]]
+          body:
+            - decl: [dir_path, string, "${<.git_dir}/${rel}"]
+            - if: { condition: { not: [{ call: [io.is_dir, dir_path] }] }, then: [{ return: [] }] }
+            - decl: [entries, list<path>, { call: [io.list_dir, dir_path] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, entries.len] }
+                body:
+                  - decl: [entry, path, { call: [entries.get, idx] }]
+                  - decl: [fname, string, { call: [entry.name] }]
+                  - decl: [child, string, "${rel}/${fname}"]
+                  - if:
+                      condition: { call: [io.is_dir, "${<.git_dir}/${child}"] }
+                      then:
+                        - call: [<.scan_refs, child, prefix]
+                      else:
+                        - if:
+                            condition: { and: [{ eq: [{ call: [child.starts_with, prefix] }, 1] }, { eq: [{ call: [fname.ends_with, ".tmp"] }, 0] }] }
+                            then:
+                              - decl: [content, string, { call: [io.read_file, "${<.git_dir}/${child}"] }]
+                              - decl: [ent, ufo.repo.RefEntry]
+                              - set: [ent.name, child]
+                              - set: [ent.oid, { call: [content.trim] }]
+                              - call: [<.scanned.push, ent]
+                  - set: [idx, { +: [idx, 1] }]

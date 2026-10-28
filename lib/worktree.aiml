@@ -1,0 +1,125 @@
+# ufo.worktree — directory ⇄ git tree.
+#
+# snapshot: files become blobs (100644, or 100755 when executable), symlinks
+# 120000 blobs holding the link target, directories trees.  Git has no empty
+# directories; with `keep_empty` an empty directory gets a `.ufo-keep` file
+# (layers need them: an empty /tmp in a stage result is content).
+# checkout: the reverse, into an existing or new directory.
+#
+# Ownership, other permission bits, xattrs and device nodes are not part of a
+# git tree — ufo.layer records them separately.
+
+- namespace: ufo.worktree
+
+- import: "object.aiml"
+- import: "repo.aiml"
+
+- class:
+    name: Snapshotter
+    members:
+      - [files, i64, 0, { access: public }]
+      - [keep_empty, i32, 0, { access: public }]
+      - [skip_top, list<string>, null, { access: public }]   # names ignored at the top level (".git")
+    methods:
+      # Entry for one directory item (oid "" = nothing to store).
+      - def:
+          name: entry_for
+          args: [[repo, ref<ufo.repo.Repository>], [full, string], [name, string], [depth, i32]]
+          return: ufo.object.TreeEntry
+          body:
+            - decl: [ent, ufo.object.TreeEntry]
+            - set: [ent.name, name]
+            - if:
+                condition: { call: [io.is_symlink, full] }
+                then:
+                  - set: [ent.mode, "120000"]
+                  - set: [ent.oid, { call: [repo.write_object, "blob", { call: [bytes.from_string, { call: [io.read_link, full] }] }] }]
+                  - set: [<.files, { +: [<.files, 1] }]
+                  - return: [ent]
+            - if:
+                condition: { call: [io.is_dir, full] }
+                then:
+                  - set: [ent.mode, "40000"]
+                  - set: [ent.oid, { call: [<.snapshot, repo, full, { +: [depth, 1] }] }]
+                  - return: [ent]
+            - set: [ent.mode, "100644"]
+            - if: { condition: { call: [io.can_exec, full] }, then: [{ set: [ent.mode, "100755"] }] }
+            - set: [ent.oid, { call: [repo.write_object, "blob", { call: [bytes.read_file, full] }] }]
+            - set: [<.files, { +: [<.files, 1] }]
+            - return: [ent]
+
+      # Writes the tree for `dir` into `repo`; returns its id ("" for an empty
+      # directory when keep_empty is off).
+      - def:
+          name: snapshot
+          args: [[repo, ref<ufo.repo.Repository>], [dir, string], [depth, i32]]
+          return: string
+          body:
+            - decl: [entries, list<ufo.object.TreeEntry>]
+            - decl: [listing, list<path>, { call: [io.list_dir, dir] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, listing.len] }
+                body:
+                  - decl: [item, path, { call: [listing.get, idx] }]
+                  - decl: [name, string, { call: [item.name] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [skipped, i32, 0]
+                  - if: { condition: { and: [{ eq: [depth, 0] }, { eq: [{ call: [<.skip_top.contains, name] }, 1] }] }, then: [{ set: [skipped, 1] }] }
+                  - if:
+                      condition: { eq: [skipped, 0] }
+                      then:
+                        - decl: [ent, ufo.object.TreeEntry, { call: [<.entry_for, repo, "${dir}/${name}", name, depth] }]
+                        - if: { condition: { gt: [ent.oid.len, 0] }, then: [{ call: [entries.push, ent] }] }
+            - if:
+                condition: { and: [{ eq: [entries.len, 0] }, { gt: [depth, 0] }] }
+                then:
+                  - if: { condition: { eq: [<.keep_empty, 0] }, then: [{ return: [""] }] }
+                  - decl: [keep, ufo.object.TreeEntry]
+                  - set: [keep.name, ".ufo-keep"]
+                  - set: [keep.mode, "100644"]
+                  - set: [keep.oid, { call: [repo.write_object, "blob", { call: [bytes.from_string, ""] }] }]
+                  - call: [entries.push, keep]
+            - return: [{ call: [repo.write_object, "tree", { call: [ufo.object.tree_encode, entries] }] }]
+
+# Writes tree `tree_oid` into `dir`.  Returns the number of files written, -1
+# on a missing object.
+- def:
+    name: checkout
+    static_off: ["str_cmp"]
+    args: [[repo, ref<ufo.repo.Repository>], [tree_oid, string], [dir, string]]
+    return: i64
+    body:
+      - call: [io.mkdir_all, dir]
+      - decl: [written, i64, 0]
+      - decl: [raw, buffer<u8>, { call: [repo.read_raw, tree_oid] }]
+      - if: { condition: { neq: [{ call: [ufo.object.kind_of, raw] }, "tree"] }, then: [{ return: [-1] }] }
+      - decl: [entries, list<ufo.object.TreeEntry>, { call: [ufo.object.tree_decode, { call: [ufo.object.body_of, raw] }] }]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, entries.len] }
+          body:
+            - decl: [ent, ufo.object.TreeEntry, { at: [entries, idx] }]
+            - set: [idx, { +: [idx, 1] }]
+            - decl: [full, string, "${dir}/${ent.name}"]
+            - if:
+                condition: { eq: [ent.mode, "40000"] }
+                then:
+                  - decl: [sub, i64, { call: [ufo.worktree.checkout, repo, ent.oid, full] }]
+                  - if: { condition: { lt: [sub, 0] }, then: [{ return: [-1] }] }
+                  - set: [written, { +: [written, sub] }]
+                else:
+                  - if:
+                      condition: { neq: [ent.mode, "160000"] }
+                      then:
+                        - decl: [body, buffer<u8>, { call: [repo.read_body, ent.oid] }]
+                        - if: { condition: { call: [io.exists, full] }, then: [{ call: [io.remove, full] }] }
+                        - if:
+                            condition: { eq: [ent.mode, "120000"] }
+                            then:
+                              - call: [io.symlink, { call: [bytes.text, body] }, full]
+                            else:
+                              - call: [io.write_file, full, body]
+                              - if: { condition: { eq: [ent.mode, "100755"] }, then: [{ call: [io.set_exec, full, true] }] }
+                        - set: [written, { +: [written, 1] }]
+      - return: [written]

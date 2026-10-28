@@ -1,0 +1,292 @@
+# ufo.packwrite — writing packs and indexing received ones (`git index-pack`).
+#
+# PackBuilder streams a pack to disk (no deltas: every object whole — valid for
+# every git server, just larger).  index_pack reads a complete pack, checks its
+# trailer, resolves ofs/ref deltas, and writes the matching idx v2.
+
+- namespace: ufo.packwrite
+
+- import: "object.aiml"
+- import: "pack.aiml"
+
+# Type+size header of a pack entry.
+- def:
+    name: entry_header
+    args: [[kind, i32], [size, i64]]
+    return: buffer<u8>
+    body:
+      - decl: [rest, i64, { shr: [size, 4] }]
+      - decl: [first, i32, { bor: [{ shl: [kind, 4] }, { band: [size, 15] }] }]
+      - if: { condition: { gt: [rest, 0] }, then: [{ set: [first, { bor: [first, 128] }] }] }
+      - decl: [out, buffer<u8>, { call: [bytes.from_u8, first] }]
+      - while:
+          condition: { gt: [rest, 0] }
+          body:
+            - decl: [part, i32, { band: [rest, 127] }]
+            - set: [rest, { shr: [rest, 7] }]
+            - if: { condition: { gt: [rest, 0] }, then: [{ set: [part, { bor: [part, 128] }] }] }
+            - set: [out, { call: [bytes.concat, out, { call: [bytes.from_u8, part] }] }]
+      - return: [out]
+
+# Appends `data` to the file at `file_path`.  0 or -1.
+- def:
+    name: append
+    args: [[file_path, string], [data, buffer<u8>]]
+    return: i32
+    body:
+      - decl: [out, file_handle, { call: [io.open, file_path, "ab"] }]
+      - if: { condition: { eq: [out, null] }, then: [{ return: [-1] }] }
+      - decl: [wrote, i32, { call: [data.write_to, out] }]
+      - call: [io.close, out]
+      - if: { condition: { neq: [wrote, data.len] }, then: [{ return: [-1] }] }
+      - return: [0]
+
+- class:
+    name: PackBuilder
+    members:
+      - [pack_path, string, "", { access: public }]
+      - [expected, i64, 0]
+      - [added, i64, 0]
+      - [failed, i32, 0, { access: public }]
+    methods:
+      - def:
+          name: begin
+          args: [[pack_path, string], [count, i64]]
+          return: i32
+          body:
+            - set: [<.pack_path, pack_path]
+            - set: [<.expected, count]
+            - call: [io.write_file, pack_path, ""]
+            - decl: [magic, buffer<u8>, { call: [bytes.from_string, "PACK"] }]
+            - decl: [head, buffer<u8>, { call: [bytes.concat, magic, { call: [bytes.from_be32, 2] }] }]
+            - set: [head, { call: [bytes.concat, head, { call: [bytes.from_be32, count] }] }]
+            - if: { condition: { neq: [{ call: [ufo.packwrite.append, pack_path, head] }, 0] }, then: [{ set: [<.failed, 1] }, { return: [-1] }] }
+            - return: [0]
+
+      # Adds one raw object ("<kind> <size>\0<body>").
+      - def:
+          name: add
+          args: [[raw, buffer<u8>]]
+          return: i32
+          body:
+            - decl: [kind, i32, { call: [ufo.pack.kind_code, { call: [ufo.object.kind_of, raw] }] }]
+            - decl: [body, buffer<u8>, { call: [ufo.object.body_of, raw] }]
+            - if: { condition: { eq: [kind, 0] }, then: [{ set: [<.failed, 1] }, { return: [-1] }] }
+            - decl: [entry, buffer<u8>, { call: [ufo.packwrite.entry_header, kind, body.len] }]
+            - set: [entry, { call: [bytes.concat, entry, { call: [bytes.zlib, body] }] }]
+            - if: { condition: { neq: [{ call: [ufo.packwrite.append, <.pack_path, entry] }, 0] }, then: [{ set: [<.failed, 1] }, { return: [-1] }] }
+            - set: [<.added, { +: [<.added, 1] }]
+            - return: [0]
+
+      # Appends the trailer; returns the pack checksum (hex) or "".
+      - def:
+          name: finish
+          return: string
+          body:
+            - if: { condition: { or: [{ eq: [<.failed, 1] }, { neq: [<.added, <.expected] }] }, then: [{ return: [""] }] }
+            - decl: [whole, buffer<u8>, { call: [bytes.read_file, <.pack_path] }]
+            - decl: [digest, string, { call: [hash.sha1, whole] }]
+            - if: { condition: { neq: [{ call: [ufo.packwrite.append, <.pack_path, { call: [bytes.from_hex, digest] }] }, 0] }, then: [{ return: [""] }] }
+            - return: [digest]
+
+# ── index-pack ───────────────────────────────────────────────────────────────
+- class:
+    name: Indexer
+    members:
+      - [data, buffer<u8>]
+      - [offsets, list<i64>]
+      - [crcs, list<i64>]
+      - [oids, list<string>]
+      - [raws, list<buffer<u8>>]
+      - [by_offset, map<string:i32>]
+      - [by_oid, map<string:i32>]
+      - [problem, string, "", { access: public }]
+    methods:
+      # Raw object of entry `num` (memoised), empty while its base is unknown.
+      - def:
+          name: raw_of
+          args: [[num, i32]]
+          return: buffer<u8>
+          body:
+            - decl: [have, buffer<u8>, { call: [<.raws.get, num] }]
+            - if: { condition: { gt: [have.len, 0] }, then: [{ return: [have] }] }
+            - decl: [empty, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - decl: [offset, i64, { call: [<.offsets.get, num] }]
+            - decl: [ent, ufo.pack.Entry, { call: [ufo.pack.parse_entry, <.data, offset] }]
+            - decl: [inflated, buffer<u8>, { call: [bytes.zlib_at, <.data, ent.data_off] }]
+            - decl: [raw, buffer<u8>]
+            - if:
+                condition: { le: [ent.kind, 4] }
+                then:
+                  - set: [raw, { call: [ufo.object.frame, { call: [ufo.pack.kind_name, ent.kind] }, inflated] }]
+                else:
+                  - decl: [base_num, i32, -1]
+                  - if:
+                      condition: { eq: [ent.kind, 6] }
+                      then:
+                        - decl: [okey, string, "${ent.base_off}"]
+                        - if: { condition: { eq: [{ call: [<.by_offset.contains, okey] }, 1] }, then: [{ set: [base_num, { call: [<.by_offset.get, okey] }] }] }
+                      else:
+                        - if: { condition: { eq: [{ call: [<.by_oid.contains, ent.base_oid] }, 1] }, then: [{ set: [base_num, { call: [<.by_oid.get, ent.base_oid] }] }] }
+                  - if: { condition: { lt: [base_num, 0] }, then: [{ return: [empty] }] }
+                  - decl: [base_raw, buffer<u8>, { call: [<.raw_of, base_num] }]
+                  - if: { condition: { eq: [base_raw.len, 0] }, then: [{ return: [empty] }] }
+                  - decl: [patched, buffer<u8>, { call: [bytes.delta_apply, { call: [ufo.object.body_of, base_raw] }, inflated] }]
+                  - set: [raw, { call: [ufo.object.frame, { call: [ufo.object.kind_of, base_raw] }, patched] }]
+            - idx: [<.raws, num, raw]
+            - decl: [oid, string, { call: [hash.sha1, raw] }]
+            - idx: [<.oids, num, oid]
+            - call: [<.by_oid.put, oid, num]
+            - return: [raw]
+
+      # Indexes <base>.pack into <base>.idx.  Returns the pack checksum or "".
+      - def:
+          name: run
+          args: [[base, string]]
+          return: string
+          body:
+            - set: [<.data, { call: [bytes.read_file, "${base}.pack"] }]
+            - if:
+                condition: { or: [{ lt: [<.data.len, 32] }, { neq: [{ call: [bytes.text, <.data, 0, 4] }, "PACK"] }] }
+                then: [{ set: [<.problem, "not a pack"] }, { return: [""] }]
+            - decl: [trailer_at, i64, { -: [<.data.len, 20] }]
+            - decl: [body_part, buffer<u8>, { call: [bytes.slice, <.data, 0, trailer_at] }]
+            - decl: [pack_sha, string, { call: [hash.sha1, body_part] }]
+            - if:
+                condition: { neq: [pack_sha, { call: [bytes.to_hex, <.data, trailer_at, 20] }] }
+                then: [{ set: [<.problem, "pack checksum mismatch"] }, { return: [""] }]
+            - decl: [count, i64, { call: [bytes.be32, <.data, 8] }]
+            - decl: [pos, i64, 12]
+            - decl: [num, i32, 0]
+            - decl: [empty, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - while:
+                condition: { lt: [num, count] }
+                body:
+                  - decl: [ent, ufo.pack.Entry, { call: [ufo.pack.parse_entry, <.data, pos] }]
+                  - if: { condition: { eq: [ent.valid, 0] }, then: [{ set: [<.problem, "bad entry at ${pos}"] }, { return: [""] }] }
+                  - decl: [probe, buffer<u8>, { call: [bytes.zlib_at, <.data, ent.data_off] }]
+                  - decl: [used, i64, { call: [bytes.zlib_consumed] }]
+                  - if: { condition: { or: [{ lt: [used, 0] }, { neq: [probe.len, ent.size] }] }, then: [{ set: [<.problem, "bad zlib stream at ${pos}"] }, { return: [""] }] }
+                  - decl: [next, i64, { +: [ent.data_off, used] }]
+                  - call: [<.offsets.push, pos]
+                  - call: [<.crcs.push, { call: [bytes.crc32, <.data, pos, { -: [next, pos] }] }]
+                  - call: [<.oids.push, ""]
+                  - call: [<.raws.push, empty]
+                  - call: [<.by_offset.put, "${pos}", num]
+                  - set: [pos, next]
+                  - set: [num, { +: [num, 1] }]
+            - if: { condition: { neq: [pos, trailer_at] }, then: [{ set: [<.problem, "trailing bytes after the last entry"] }, { return: [""] }] }
+            # Resolve: repeat while progress is made (a ref-delta may name a base
+            # that appears later in the pack).
+            - decl: [left, i64, count]
+            - decl: [progress, i32, 1]
+            - while:
+                condition: { and: [{ gt: [left, 0] }, { eq: [progress, 1] }] }
+                body:
+                  - set: [progress, 0]
+                  - set: [left, 0]
+                  - decl: [rdx, i32, 0]
+                  - while:
+                      condition: { lt: [rdx, count] }
+                      body:
+                        - decl: [known, string, { call: [<.oids.get, rdx] }]
+                        - if:
+                            condition: { eq: [known.len, 0] }
+                            then:
+                              - decl: [got, buffer<u8>, { call: [<.raw_of, rdx] }]
+                              - if: { condition: { gt: [got.len, 0] }, then: [{ set: [progress, 1] }], else: [{ set: [left, { +: [left, 1] }] }] }
+                        - set: [rdx, { +: [rdx, 1] }]
+            - if: { condition: { gt: [left, 0] }, then: [{ set: [<.problem, "${left} object(s) with a base outside the pack (thin pack)"] }, { return: [""] }] }
+            - call: [<.write_idx, base, pack_sha, count]
+            - return: [pack_sha]
+
+      - def:
+          name: write_idx
+          args: [[base, string], [pack_sha, string], [count, i64]]
+          body:
+            - decl: [sorted, list<string>]
+            - decl: [sdx, i32, 0]
+            - while:
+                condition: { lt: [sdx, count] }
+                body:
+                  - call: [sorted.push, { call: [<.oids.get, sdx] }]
+                  - set: [sdx, { +: [sdx, 1] }]
+            - call: [sorted.sort]
+            - decl: [idx_path, string, "${base}.idx.tmp"]
+            - call: [io.write_file, idx_path, ""]
+            - decl: [head, buffer<u8>, { call: [bytes.from_hex, "ff744f6300000002"] }]
+            # fan-out: number of ids whose first byte ≤ b
+            - decl: [firsts, list<i32>]
+            - decl: [fdx, i32, 0]
+            - while:
+                condition: { lt: [fdx, sorted.len] }
+                body:
+                  - decl: [one_id, string, { call: [sorted.get, fdx] }]
+                  - decl: [lead, buffer<u8>, { call: [bytes.from_hex, { call: [one_id.substr, 0, 2] }] }]
+                  - call: [firsts.push, { call: [bytes.u8, lead, 0] }]
+                  - set: [fdx, { +: [fdx, 1] }]
+            - decl: [fan, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - decl: [bucket, i32, 0]
+            - decl: [cursor, i32, 0]
+            - while:
+                condition: { lt: [bucket, 256] }
+                body:
+                  - decl: [moving, i32, 1]
+                  - while:
+                      condition: { and: [{ eq: [moving, 1] }, { lt: [cursor, firsts.len] }] }
+                      body:
+                        - if:
+                            condition: { le: [{ call: [firsts.get, cursor] }, bucket] }
+                            then: [{ set: [cursor, { +: [cursor, 1] }] }]
+                            else: [{ set: [moving, 0] }]
+                  - set: [fan, { call: [bytes.concat, fan, { call: [bytes.from_be32, cursor] }] }]
+                  - set: [bucket, { +: [bucket, 1] }]
+            - call: [ufo.packwrite.append, idx_path, { call: [bytes.concat, head, fan] }]
+            - decl: [ndx, i32, 0]
+            - while:
+                condition: { lt: [ndx, sorted.len] }
+                body:
+                  - call: [ufo.packwrite.append, idx_path, { call: [bytes.from_hex, { call: [sorted.get, ndx] }] }]
+                  - set: [ndx, { +: [ndx, 1] }]
+            - decl: [cdx, i32, 0]
+            - while:
+                condition: { lt: [cdx, sorted.len] }
+                body:
+                  - decl: [num, i32, { call: [<.by_oid.get, { call: [sorted.get, cdx] }] }]
+                  - call: [ufo.packwrite.append, idx_path, { call: [bytes.from_be32, { call: [<.crcs.get, num] }] }]
+                  - set: [cdx, { +: [cdx, 1] }]
+            - decl: [large, list<i64>]
+            - decl: [odx, i32, 0]
+            - while:
+                condition: { lt: [odx, sorted.len] }
+                body:
+                  - decl: [num, i32, { call: [<.by_oid.get, { call: [sorted.get, odx] }] }]
+                  - decl: [offset, i64, { call: [<.offsets.get, num] }]
+                  - if:
+                      condition: { lt: [offset, 2147483648] }
+                      then: [{ call: [ufo.packwrite.append, idx_path, { call: [bytes.from_be32, offset] }] }]
+                      else:
+                        - call: [ufo.packwrite.append, idx_path, { call: [bytes.from_be32, { +: [2147483648, large.len] }] }]
+                        - call: [large.push, offset]
+                  - set: [odx, { +: [odx, 1] }]
+            - decl: [ldx, i32, 0]
+            - while:
+                condition: { lt: [ldx, large.len] }
+                body:
+                  - decl: [big, i64, { call: [large.get, ldx] }]
+                  - call: [ufo.packwrite.append, idx_path, { call: [bytes.concat, { call: [bytes.from_be32, { shr: [big, 32] }] }, { call: [bytes.from_be32, { band: [big, 4294967295] }] }] }]
+                  - set: [ldx, { +: [ldx, 1] }]
+            - call: [ufo.packwrite.append, idx_path, { call: [bytes.from_hex, pack_sha] }]
+            - decl: [so_far, buffer<u8>, { call: [bytes.read_file, idx_path] }]
+            - call: [ufo.packwrite.append, idx_path, { call: [bytes.from_hex, { call: [hash.sha1, so_far] }] }]
+            - call: [io.rename, idx_path, "${base}.idx"]
+
+- def:
+    name: index_pack
+    args: [[base, string]]
+    return: string
+    body:
+      - decl: [worker, ptr<ufo.packwrite.Indexer>, { new: ufo.packwrite.Indexer }]
+      - decl: [sha, string, { call: [worker.run, base] }]
+      - if: { condition: { eq: [sha.len, 0] }, then: [{ call: [log.error, "index-pack ${base}: ${worker.problem}"] }] }
+      - return: [sha]

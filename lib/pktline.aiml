@@ -1,0 +1,119 @@
+# ufo.pktline — git's pkt-line framing (gitprotocol-common).
+#
+#   "<4 hex digits: length incl. these 4><payload>"
+#   0000 flush   0001 delimiter (protocol v2)   0002 response end (v2)
+#
+# Reader walks a whole response held in a buffer.
+
+- namespace: ufo.pktline
+
+- def:
+    name: hex4
+    args: [[value, i64]]
+    return: string
+    body:
+      - decl: [digits, string, "0123456789abcdef"]
+      - decl: [out, string, ""]
+      - decl: [rest, i64, value]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, 4] }
+          body:
+            - decl: [nib, i64, { band: [rest, 15] }]
+            - set: [out, "${{ call: [digits.substr, nib, 1] }}${out}"]
+            - set: [rest, { shr: [rest, 4] }]
+            - set: [idx, { +: [idx, 1] }]
+      - return: [out]
+
+# One data packet carrying `text` (callers add the trailing "\n").
+- def:
+    name: line
+    args: [[text, string]]
+    return: buffer<u8>
+    body:
+      - decl: [payload, buffer<u8>, { call: [bytes.from_string, text] }]
+      - decl: [head, buffer<u8>, { call: [bytes.from_string, { call: [ufo.pktline.hex4, { +: [payload.len, 4] }] }] }]
+      - return: [{ call: [bytes.concat, head, payload] }]
+
+# A data packet with binary payload.
+- def:
+    name: packet
+    args: [[payload, buffer<u8>]]
+    return: buffer<u8>
+    body:
+      - decl: [head, buffer<u8>, { call: [bytes.from_string, { call: [ufo.pktline.hex4, { +: [payload.len, 4] }] }] }]
+      - return: [{ call: [bytes.concat, head, payload] }]
+
+- def:
+    name: flush
+    return: buffer<u8>
+    body:
+      - return: [{ call: [bytes.from_string, "0000"] }]
+
+- def:
+    name: delim
+    return: buffer<u8>
+    body:
+      - return: [{ call: [bytes.from_string, "0001"] }]
+
+- class:
+    name: Reader
+    members:
+      - [data, buffer<u8>]
+      - [pos, i64, 0, { access: public }]
+      # last packet: kind 0 data, 1 flush, 2 delim, 3 response-end, -1 end of input / error
+      - [kind, i32, -1, { access: public }]
+      - [payload_off, i64, 0, { access: public }]
+      - [payload_len, i64, 0, { access: public }]
+    methods:
+      - def:
+          name: load
+          args: [[data, buffer<u8>]]
+          body:
+            - set: [<.data, data]
+            - set: [<.pos, 0]
+
+      # Reads the next packet; returns its kind.
+      - def:
+          name: next
+          return: i32
+          body:
+            - decl: [head, string, { call: [bytes.text, <.data, <.pos, 4] }]
+            - if: { condition: { neq: [head.len, 4] }, then: [{ set: [<.kind, -1] }, { return: [-1] }] }
+            - decl: [raw, buffer<u8>, { call: [bytes.from_hex, "0000${head}"] }]
+            - decl: [size, i64, { call: [bytes.be32, raw, 0] }]
+            - if: { condition: { lt: [size, 0] }, then: [{ set: [<.kind, -1] }, { return: [-1] }] }
+            - set: [<.pos, { +: [<.pos, 4] }]
+            - if: { condition: { eq: [size, 0] }, then: [{ set: [<.kind, 1] }, { return: [1] }] }
+            - if: { condition: { eq: [size, 1] }, then: [{ set: [<.kind, 2] }, { return: [2] }] }
+            - if: { condition: { eq: [size, 2] }, then: [{ set: [<.kind, 3] }, { return: [3] }] }
+            - if: { condition: { or: [{ lt: [size, 4] }, { gt: [{ +: [{ -: [<.pos, 4] }, size] }, <.data.len] }] }, then: [{ set: [<.kind, -1] }, { return: [-1] }] }
+            - set: [<.payload_off, <.pos]
+            - set: [<.payload_len, { -: [size, 4] }]
+            - set: [<.pos, { +: [<.pos, <.payload_len] }]
+            - set: [<.kind, 0]
+            - return: [0]
+
+      # Payload of the last data packet as text, without a trailing "\n".
+      - def:
+          name: text
+          return: string
+          body:
+            - decl: [out, string, { call: [bytes.text, <.data, <.payload_off, <.payload_len] }]
+            - if: { condition: { eq: [{ call: [out.ends_with, "\n"] }, 1] }, then: [{ set: [out, { call: [out.substr, 0, { -: [out.len, 1] }] }] }] }
+            - return: [out]
+
+      # Payload of the last data packet as bytes.
+      - def:
+          name: payload
+          return: buffer<u8>
+          body:
+            - return: [{ call: [bytes.slice, <.data, <.payload_off, <.payload_len] }]
+
+      # First payload byte (the side-band channel), -1 for none.
+      - def:
+          name: band
+          return: i32
+          body:
+            - if: { condition: { lt: [<.payload_len, 1] }, then: [{ return: [-1] }] }
+            - return: [{ call: [bytes.u8, <.data, <.payload_off] }]

@@ -1,0 +1,444 @@
+# ufo.remote — git's smart HTTP protocol (gitprotocol-http, gitprotocol-v2,
+# gitprotocol-pack).
+#
+#   ls-refs / fetch  protocol v2 against git-upload-pack:
+#     GET  <url>/info/refs?service=git-upload-pack     (Git-Protocol: version=2)
+#     POST <url>/git-upload-pack   command=ls-refs | command=fetch
+#   push             receive-pack (v0, there is no v2 push):
+#     GET  <url>/info/refs?service=git-receive-pack
+#     POST <url>/git-receive-pack  "<old> <new> <ref>" commands + pack
+#
+# Fetch never asks for thin packs, so a received pack is self-contained and is
+# indexed as is.  Push sends whole objects (no deltas).  Auth: UFO_HTTP_TOKEN
+# (Bearer) or UFO_HTTP_USER + UFO_HTTP_PASSWORD (Basic; a GitHub token works
+# as the password).
+
+- namespace: ufo.remote
+
+- import: "object.aiml"
+- import: "repo.aiml"
+- import: "pktline.aiml"
+- import: "packwrite.aiml"
+- import: "walk.aiml"
+
+- model:
+    name: RefUpdate
+    fields:
+      - [name, string, ""]
+      - [old_oid, string, ""]     # what the remote has ("0"*40 = create)
+      - [new_oid, string, ""]     # what it should get ("0"*40 = delete)
+      - [status, string, ""]      # "ok" / "ng" / "" (not reported)
+      - [reason, string, ""]
+
+- def:
+    name: zero_id
+    return: string
+    body:
+      - return: ["0000000000000000000000000000000000000000"]
+
+- class:
+    name: Transport
+    members:
+      - [base, string, "", { access: public }]
+      - [tmp_dir, string, "/tmp", { access: public }]
+      - [status, i32, 0, { access: public }]
+      - [error, string, "", { access: public }]
+    methods:
+      - def:
+          name: init
+          args: [[base, string], [tmp_dir, string]]
+          body:
+            - decl: [trimmed, string, base]
+            - if: { condition: { eq: [{ call: [trimmed.ends_with, "/"] }, 1] }, then: [{ set: [trimmed, { call: [trimmed.substr, 0, { -: [trimmed.len, 1] }] }] }] }
+            - set: [<.base, trimmed]
+            - set: [<.tmp_dir, tmp_dir]
+            - call: [io.mkdir_all, tmp_dir]
+
+      - def:
+          name: authorize
+          args: [[client, http_client_handle]]
+          body:
+            - decl: [envm, map<string:string>, { call: [sys.env] }]
+            - if:
+                condition: { eq: [{ call: [envm.contains, "UFO_HTTP_TOKEN"] }, 1] }
+                then:
+                  - decl: [bearer, string, { call: [envm.get, "UFO_HTTP_TOKEN"] }]
+                  - call: [client.headers.put, "Authorization", "Bearer ${bearer}"]
+                  - return: []
+            - if:
+                condition: { and: [{ eq: [{ call: [envm.contains, "UFO_HTTP_USER"] }, 1] }, { eq: [{ call: [envm.contains, "UFO_HTTP_PASSWORD"] }, 1] }] }
+                then:
+                  - decl: [user, string, { call: [envm.get, "UFO_HTTP_USER"] }]
+                  - decl: [secret, string, { call: [envm.get, "UFO_HTTP_PASSWORD"] }]
+                  - decl: [pair, string, "${user}:${secret}"]
+                  - call: [client.headers.put, "Authorization", "Basic ${{ call: [base64.encode, pair] }}"]
+
+      # One HTTP exchange; the response body as bytes ("" + status/error set on failure).
+      - def:
+          name: exchange
+          static_off: ["str_cmp"]
+          args: [[method, string], [tail, string], [content_type, string], [body, buffer<u8>], [proto_v2, i32]]
+          return: buffer<u8>
+          body:
+            - decl: [empty, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - decl: [dest, url, { call: [http.parse_url, "${<.base}/${tail}"] }]
+            - decl: [client, http_client_handle, { call: [http.new_request, method, dest] }]
+            - call: [client.headers.put, "User-Agent", "git/2.0 (ufo/0.1)"]
+            - if: { condition: { eq: [proto_v2, 1] }, then: [{ call: [client.headers.put, "Git-Protocol", "version=2"] }] }
+            - call: [<.authorize, client]
+            - set: [client.timeout, 600000]
+            - decl: [stamp, string, { call: [math.random_hex, 6] }]
+            - decl: [req_file, string, "${<.tmp_dir}/req-${stamp}"]
+            - decl: [resp_file, string, "${<.tmp_dir}/resp-${stamp}"]
+            - if:
+                condition: { eq: [method, "POST"] }
+                then:
+                  - call: [client.headers.put, "Content-Type", content_type]
+                  - call: [client.headers.put, "Accept", { call: [content_type.replace, "-request", "-result"] }]
+                  - call: [io.write_file, req_file, body]
+                  - set: [client.body_file, req_file]
+            - decl: [answer, http_response_handle, { call: [client.send] }]
+            - if: { condition: { call: [io.exists, req_file] }, then: [{ call: [io.remove, req_file] }] }
+            - if:
+                condition: { eq: [answer, null] }
+                then:
+                  - set: [<.status, 0]
+                  - set: [<.error, "${<.base}: no answer"]
+                  - return: [empty]
+            - set: [<.status, { call: [answer.status] }]
+            - decl: [saved, i32, { call: [answer.save_to, resp_file] }]
+            - call: [answer.free]
+            - if:
+                condition: { or: [{ lt: [<.status, 200] }, { ge: [<.status, 300] }] }
+                then:
+                  - set: [<.error, "${method} ${tail}: HTTP ${<.status}"]
+                  - if: { condition: { call: [io.exists, resp_file] }, then: [{ call: [io.remove, resp_file] }] }
+                  - return: [empty]
+            - if: { condition: { neq: [saved, 0] }, then: [{ set: [<.error, "cannot store the response"] }, { return: [empty] }] }
+            - decl: [data, buffer<u8>, { call: [bytes.read_file, resp_file] }]
+            - call: [io.remove, resp_file]
+            - return: [data]
+
+- class:
+    name: Remote
+    members:
+      - [link, ptr<ufo.remote.Transport>, null, { access: public }]
+      - [error, string, "", { access: public }]
+      - [head_target, string, "", { access: public }]   # the remote HEAD's branch (symref)
+      - [caps, list<string>, null, { access: public }]
+    methods:
+      - def:
+          name: init
+          args: [[base, string], [tmp_dir, string]]
+          body:
+            - set: [<.link, { new: ufo.remote.Transport }]
+            - call: [<.link.init, base, tmp_dir]
+
+      # ── protocol v2: ls-refs ─────────────────────────────────────────────
+      - def:
+          name: ls_refs
+          return: list<ufo.repo.RefEntry>
+          body:
+            - decl: [out, list<ufo.repo.RefEntry>]
+            - decl: [empty, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - decl: [advert, buffer<u8>, { call: [<.link.exchange, "GET", "info/refs?service=git-upload-pack", "", empty, 1] }]
+            - if: { condition: { eq: [advert.len, 0] }, then: [{ set: [<.error, <.link.error] }, { return: [out] }] }
+            - decl: [reader, ptr<ufo.pktline.Reader>, { new: ufo.pktline.Reader }]
+            - call: [reader.load, advert]
+            - decl: [is_v2, i32, 0]
+            - decl: [going, i32, 1]
+            - while:
+                condition: { eq: [going, 1] }
+                body:
+                  - decl: [kind, i32, { call: [reader.next] }]
+                  - if:
+                      condition: { lt: [kind, 0] }
+                      then: [{ set: [going, 0] }]
+                      else:
+                        - if:
+                            condition: { eq: [kind, 0] }
+                            then:
+                              - decl: [line, string, { call: [reader.text] }]
+                              - if: { condition: { eq: [line, "version 2"] }, then: [{ set: [is_v2, 1] }] }
+                              - if: { condition: { eq: [is_v2, 1] }, then: [{ call: [<.caps.push, line] }] }
+                        - if: { condition: { and: [{ eq: [kind, 1] }, { eq: [is_v2, 1] }] }, then: [{ set: [going, 0] }] }
+            - if: { condition: { eq: [is_v2, 0] }, then: [{ set: [<.error, "the server does not speak git protocol v2"] }, { return: [out] }] }
+            - decl: [req, buffer<u8>, { call: [ufo.pktline.line, "command=ls-refs\n"] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "agent=ufo/0.1\n"] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.delim] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "symrefs\n"] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "peel\n"] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.flush] }] }]
+            - decl: [answer, buffer<u8>, { call: [<.link.exchange, "POST", "git-upload-pack", "application/x-git-upload-pack-request", req, 1] }]
+            - if: { condition: { eq: [answer.len, 0] }, then: [{ set: [<.error, <.link.error] }, { return: [out] }] }
+            - call: [reader.load, answer]
+            - while:
+                condition: { eq: [{ call: [reader.next] }, 0] }
+                body:
+                  - decl: [line, string, { call: [reader.text] }]
+                  - decl: [parts, list<string>, { call: [line.split, " "] }]
+                  - if:
+                      condition: { ge: [parts.len, 2] }
+                      then:
+                        - decl: [ent, ufo.repo.RefEntry]
+                        - set: [ent.oid, { call: [parts.get, 0] }]
+                        - set: [ent.name, { call: [parts.get, 1] }]
+                        - decl: [adx, i32, 2]
+                        - while:
+                            condition: { lt: [adx, parts.len] }
+                            body:
+                              - decl: [attr, string, { call: [parts.get, adx] }]
+                              - if:
+                                  condition: { and: [{ eq: [ent.name, "HEAD"] }, { eq: [{ call: [attr.starts_with, "symref-target:"] }, 1] }] }
+                                  then: [{ set: [<.head_target, { call: [attr.substr, 14] }] }]
+                              - set: [adx, { +: [adx, 1] }]
+                        - if: { condition: { neq: [ent.oid, "unborn"] }, then: [{ call: [out.push, ent] }] }
+            - return: [out]
+
+      # ── protocol v2: fetch ───────────────────────────────────────────────
+      # Asks for `wants`, tells about `haves`, stores the pack in `repo`.
+      # Returns the number of objects received (0 = nothing to do), -1 on error.
+      - def:
+          name: fetch
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [wants, list<string>], [haves, list<string>]]
+          return: i64
+          body:
+            - if: { condition: { eq: [wants.len, 0] }, then: [{ return: [0] }] }
+            - decl: [req, buffer<u8>, { call: [ufo.pktline.line, "command=fetch\n"] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "agent=ufo/0.1\n"] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.delim] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "ofs-delta\n"] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "no-progress\n"] }] }]
+            - decl: [wdx, i32, 0]
+            - while:
+                condition: { lt: [wdx, wants.len] }
+                body:
+                  - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "want ${{ call: [wants.get, wdx] }}\n"] }] }]
+                  - set: [wdx, { +: [wdx, 1] }]
+            - decl: [hdx, i32, 0]
+            - while:
+                condition: { lt: [hdx, haves.len] }
+                body:
+                  - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "have ${{ call: [haves.get, hdx] }}\n"] }] }]
+                  - set: [hdx, { +: [hdx, 1] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "done\n"] }] }]
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.flush] }] }]
+            - decl: [answer, buffer<u8>, { call: [<.link.exchange, "POST", "git-upload-pack", "application/x-git-upload-pack-request", req, 1] }]
+            - if: { condition: { eq: [answer.len, 0] }, then: [{ set: [<.error, <.link.error] }, { return: [-1] }] }
+            - decl: [reader, ptr<ufo.pktline.Reader>, { new: ufo.pktline.Reader }]
+            - call: [reader.load, answer]
+            - decl: [pack_dir, string, "${repo.git_dir}/objects/pack"]
+            - call: [io.mkdir_all, pack_dir]
+            - decl: [tmp_base, string, "${pack_dir}/tmp-${{ call: [math.random_hex, 6] }}"]
+            - call: [io.write_file, "${tmp_base}.pack", ""]
+            - decl: [in_pack, i32, 0]
+            - decl: [going, i32, 1]
+            - while:
+                condition: { eq: [going, 1] }
+                body:
+                  - decl: [kind, i32, { call: [reader.next] }]
+                  - if:
+                      condition: { neq: [kind, 0] }
+                      then: [{ set: [going, 0] }]
+                      else:
+                        - if:
+                            condition: { eq: [in_pack, 0] }
+                            then:
+                              - decl: [line, string, { call: [reader.text] }]
+                              - if: { condition: { eq: [line, "packfile"] }, then: [{ set: [in_pack, 1] }] }
+                              - if: { condition: { eq: [{ call: [line.starts_with, "ERR "] }, 1] }, then: [{ set: [<.error, line] }, { set: [going, 0] }] }
+                            else:
+                              - decl: [band, i32, { call: [reader.band] }]
+                              - if:
+                                  condition: { eq: [band, 1] }
+                                  then:
+                                    - decl: [chunk, buffer<u8>, { call: [bytes.slice, { call: [reader.payload] }, 1] }]
+                                    - call: [ufo.packwrite.append, "${tmp_base}.pack", chunk]
+                              - if:
+                                  condition: { eq: [band, 3] }
+                                  then:
+                                    - decl: [msg, buffer<u8>, { call: [bytes.slice, { call: [reader.payload] }, 1] }]
+                                    - set: [<.error, "remote: ${{ call: [bytes.text, msg] }}"]
+                                    - set: [going, 0]
+            - if:
+                condition: { or: [{ eq: [in_pack, 0] }, { gt: [<.error.len, 0] }] }
+                then:
+                  - if: { condition: { eq: [<.error.len, 0] }, then: [{ set: [<.error, "no packfile in the fetch response"] }] }
+                  - call: [io.remove, "${tmp_base}.pack"]
+                  - return: [-1]
+            - decl: [sha, string, { call: [ufo.packwrite.index_pack, tmp_base] }]
+            - if: { condition: { eq: [sha.len, 0] }, then: [{ set: [<.error, "received pack is not valid"] }, { return: [-1] }] }
+            - decl: [final_base, string, "${pack_dir}/pack-${sha}"]
+            - call: [io.rename, "${tmp_base}.pack", "${final_base}.pack"]
+            - call: [io.rename, "${tmp_base}.idx", "${final_base}.idx"]
+            - call: [repo.rescan]
+            - decl: [packed, buffer<u8>, { call: [bytes.read_file, "${final_base}.pack"] }]
+            - return: [{ call: [bytes.be32, packed, 8] }]
+
+      # ── receive-pack: push ───────────────────────────────────────────────
+      # Advertised refs of the receiving side (name → id), "" error on failure.
+      - def:
+          name: receive_refs
+          return: list<ufo.repo.RefEntry>
+          body:
+            - decl: [out, list<ufo.repo.RefEntry>]
+            - decl: [empty, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - decl: [advert, buffer<u8>, { call: [<.link.exchange, "GET", "info/refs?service=git-receive-pack", "", empty, 0] }]
+            - if: { condition: { eq: [advert.len, 0] }, then: [{ set: [<.error, <.link.error] }, { return: [out] }] }
+            - decl: [reader, ptr<ufo.pktline.Reader>, { new: ufo.pktline.Reader }]
+            - call: [reader.load, advert]
+            - decl: [going, i32, 1]
+            - decl: [first, i32, 1]
+            - while:
+                condition: { eq: [going, 1] }
+                body:
+                  - decl: [kind, i32, { call: [reader.next] }]
+                  - if:
+                      condition: { lt: [kind, 0] }
+                      then: [{ set: [going, 0] }]
+                      else:
+                        - if:
+                            condition: { eq: [kind, 0] }
+                            then:
+                              - decl: [line, string, { call: [reader.text] }]
+                              - if:
+                                  condition: { eq: [{ call: [line.starts_with, "# service="] }, 0] }
+                                  then:
+                                    - decl: [nul, i64, { call: [bytes.find, { call: [reader.payload] }, 0, 0] }]
+                                    - if:
+                                        condition: { eq: [first, 1] }
+                                        then:
+                                          - set: [first, 0]
+                                          - if:
+                                              condition: { ge: [nul, 0] }
+                                              then:
+                                                - decl: [cap_bytes, buffer<u8>, { call: [bytes.slice, { call: [reader.payload] }, { +: [nul, 1] }] }]
+                                                - decl: [cap_text, string, { call: [bytes.text, cap_bytes] }]
+                                                - decl: [cap_trim, string, { call: [cap_text.trim] }]
+                                                - set: [<.caps, { call: [cap_trim.split, " "] }]
+                                    - decl: [ent, ufo.repo.RefEntry]
+                                    - set: [ent.oid, { call: [line.substr, 0, 40] }]
+                                    - decl: [rest, string, { call: [line.substr, 41] }]
+                                    - set: [ent.name, rest]
+                                    - if: { condition: { neq: [ent.name, "capabilities^{}"] }, then: [{ call: [out.push, ent] }] }
+            - return: [out]
+
+      # Sends `updates` (old ids filled in from the advertisement).  Statuses are
+      # written into the returned list.
+      - def:
+          name: push
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [updates, list<ufo.remote.RefUpdate>]]
+          return: list<ufo.remote.RefUpdate>
+          body:
+            - decl: [theirs, list<ufo.repo.RefEntry>, { call: [<.receive_refs] }]
+            - if: { condition: { gt: [<.error.len, 0] }, then: [{ return: [updates] }] }
+            - decl: [their_map, map<string:string>]
+            - decl: [known, list<string>]
+            - decl: [tdx, i32, 0]
+            - while:
+                condition: { lt: [tdx, theirs.len] }
+                body:
+                  - decl: [ref, ufo.repo.RefEntry, { at: [theirs, tdx] }]
+                  - call: [their_map.put, ref.name, ref.oid]
+                  - if: { condition: { eq: [{ call: [repo.has, ref.oid] }, 1] }, then: [{ call: [known.push, ref.oid] }] }
+                  - set: [tdx, { +: [tdx, 1] }]
+            - decl: [tips, list<string>]
+            - decl: [plan, list<ufo.remote.RefUpdate>]
+            - decl: [udx, i32, 0]
+            - while:
+                condition: { lt: [udx, updates.len] }
+                body:
+                  - decl: [upd, ufo.remote.RefUpdate, { at: [updates, udx] }]
+                  - set: [upd.old_oid, { call: [ufo.remote.zero_id] }]
+                  - if: { condition: { eq: [{ call: [their_map.contains, upd.name] }, 1] }, then: [{ set: [upd.old_oid, { call: [their_map.get, upd.name] }] }] }
+                  - if: { condition: { neq: [upd.new_oid, { call: [ufo.remote.zero_id] }] }, then: [{ call: [tips.push, upd.new_oid] }] }
+                  - if:
+                      condition: { eq: [upd.old_oid, upd.new_oid] }
+                      then: [{ set: [upd.status, "ok"] }, { set: [upd.reason, "up to date"] }]
+                  - call: [plan.push, upd]
+                  - set: [udx, { +: [udx, 1] }]
+            # request: commands, flush, pack
+            - decl: [req, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - decl: [sent, i32, 0]
+            - decl: [pdx, i32, 0]
+            - while:
+                condition: { lt: [pdx, plan.len] }
+                body:
+                  - decl: [one, ufo.remote.RefUpdate, { at: [plan, pdx] }]
+                  - if:
+                      condition: { eq: [one.status.len, 0] }
+                      then:
+                        - decl: [cmd_text, string, "${one.old_oid} ${one.new_oid} ${one.name}"]
+                        - if:
+                            condition: { eq: [sent, 0] }
+                            then:
+                              - decl: [nul, buffer<u8>, { call: [bytes.from_u8, 0] }]
+                              - decl: [first_cmd, buffer<u8>, { call: [bytes.concat, { call: [bytes.from_string, cmd_text] }, nul] }]
+                              - set: [first_cmd, { call: [bytes.concat, first_cmd, "report-status agent=ufo/0.1\n"] }]
+                              - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.packet, first_cmd] }] }]
+                            else:
+                              - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.line, "${cmd_text}\n"] }] }]
+                        - set: [sent, { +: [sent, 1] }]
+                  - set: [pdx, { +: [pdx, 1] }]
+            - if: { condition: { eq: [sent, 0] }, then: [{ return: [plan] }] }
+            - set: [req, { call: [bytes.concat, req, { call: [ufo.pktline.flush] }] }]
+            - if:
+                condition: { gt: [tips.len, 0] }
+                then:
+                  - decl: [walker, ptr<ufo.walk.Walker>, { new: ufo.walk.Walker }]
+                  - call: [walker.mark, repo, known]
+                  - decl: [objects, list<string>, { call: [walker.collect, repo, tips] }]
+                  - decl: [pack_base, string, "${<.link.tmp_dir}/push-${{ call: [math.random_hex, 6] }}"]
+                  - decl: [builder, ptr<ufo.packwrite.PackBuilder>, { new: ufo.packwrite.PackBuilder }]
+                  - call: [builder.begin, "${pack_base}.pack", objects.len]
+                  - decl: [odx, i32, 0]
+                  - while:
+                      condition: { lt: [odx, objects.len] }
+                      body:
+                        - call: [builder.add, { call: [repo.read_raw, { call: [objects.get, odx] }] }]
+                        - set: [odx, { +: [odx, 1] }]
+                  - decl: [psha, string, { call: [builder.finish] }]
+                  - if: { condition: { eq: [psha.len, 0] }, then: [{ set: [<.error, "cannot build the pack"] }, { return: [plan] }] }
+                  - set: [req, { call: [bytes.concat, req, { call: [bytes.read_file, "${pack_base}.pack"] }] }]
+                  - call: [io.remove, "${pack_base}.pack"]
+            - decl: [answer, buffer<u8>, { call: [<.link.exchange, "POST", "git-receive-pack", "application/x-git-receive-pack-request", req, 0] }]
+            - if: { condition: { eq: [answer.len, 0] }, then: [{ set: [<.error, <.link.error] }, { return: [plan] }] }
+            - decl: [reader, ptr<ufo.pktline.Reader>, { new: ufo.pktline.Reader }]
+            - call: [reader.load, answer]
+            - while:
+                condition: { eq: [{ call: [reader.next] }, 0] }
+                body:
+                  - decl: [line, string, { call: [reader.text] }]
+                  - if:
+                      condition: { and: [{ eq: [{ call: [line.starts_with, "unpack "] }, 1] }, { neq: [line, "unpack ok"] }] }
+                      then: [{ set: [<.error, "remote: ${line}"] }]
+                  - decl: [ok_line, i32, { call: [line.starts_with, "ok "] }]
+                  - decl: [ng_line, i32, { call: [line.starts_with, "ng "] }]
+                  - if:
+                      condition: { or: [{ eq: [ok_line, 1] }, { eq: [ng_line, 1] }] }
+                      then:
+                        - decl: [rest, string, { call: [line.substr, 3] }]
+                        - decl: [space, i32, { call: [rest.index_of, " "] }]
+                        - decl: [ref_name, string, rest]
+                        - decl: [why, string, ""]
+                        - if:
+                            condition: { ge: [space, 0] }
+                            then:
+                              - set: [ref_name, { call: [rest.substr, 0, space] }]
+                              - set: [why, { call: [rest.substr, { +: [space, 1] }] }]
+                        - decl: [rdx, i32, 0]
+                        - while:
+                            condition: { lt: [rdx, plan.len] }
+                            body:
+                              - decl: [hit, ufo.remote.RefUpdate, { at: [plan, rdx] }]
+                              - if:
+                                  condition: { eq: [hit.name, ref_name] }
+                                  then:
+                                    - set: [hit.status, "ok"]
+                                    - if: { condition: { eq: [ng_line, 1] }, then: [{ set: [hit.status, "ng"] }] }
+                                    - set: [hit.reason, why]
+                                    - idx: [plan, rdx, hit]
+                              - set: [rdx, { +: [rdx, 1] }]
+            - return: [plan]

@@ -1,0 +1,14 @@
+# ufo — git for container stage layers, written in aiml.
+#
+#   aiml ufo.aiml -- [-C <dir>] <command> [args]     (or the built binary: ufo …)
+#
+# See README.md and lib/cli.aiml for the commands.
+
+- import: "lib/cli.aiml"
+
+- def:
+    name: main
+    return: i32
+    body:
+      - decl: [cli, ptr<ufo.cli.Cli>, { new: ufo.cli.Cli }]
+      - return: [{ call: [cli.run] }]

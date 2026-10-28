@@ -1,0 +1,80 @@
+# Expected exit code: 0
+# ufo.object against ids computed by real git (git hash-object / mktree / commit-tree).
+
+- import: "../lib/object.aiml"
+
+- def:
+    name: expect
+    args: [[what, string], [got, string], [want, string]]
+    return: i32
+    body:
+      - if:
+          condition: { eq: [got, want] }
+          then:
+            - return: [0]
+      - print: ["FAIL ${what}: got '${got}', want '${want}'"]
+      - return: [1]
+
+- def:
+    name: entry
+    args: [[mode, string], [name, string], [oid, string]]
+    return: ufo.object.TreeEntry
+    body:
+      - decl: [ent, ufo.object.TreeEntry]
+      - set: [ent.mode, mode]
+      - set: [ent.name, name]
+      - set: [ent.oid, oid]
+      - return: [ent]
+
+- def:
+    name: main
+    return: i32
+    body:
+      - decl: [fails, i32, 0]
+      - decl: [hello, buffer<u8>, { call: [bytes.from_string, "hello"] }]
+      - decl: [blob, buffer<u8>, { call: [ufo.object.frame, "blob", hello] }]
+      - set: [fails, { +: [fails, { call: [expect, "blob id", { call: [ufo.object.id_of, blob] }, "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"] }] }]
+      - set: [fails, { +: [fails, { call: [expect, "kind", { call: [ufo.object.kind_of, blob] }, "blob"] }] }]
+      - decl: [back, buffer<u8>, { call: [ufo.object.body_of, blob] }]
+      - set: [fails, { +: [fails, { call: [expect, "body", { call: [bytes.text, back] }, "hello"] }] }]
+      # tree: "a.txt" sorts before the tree "a" (compared as "a/")
+      - decl: [sub, list<ufo.object.TreeEntry>]
+      - call: [sub.push, { call: [entry, "100644", "inner.txt", "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"] }]
+      - decl: [sub_raw, buffer<u8>, { call: [ufo.object.frame, "tree", { call: [ufo.object.tree_encode, sub] }] }]
+      - set: [fails, { +: [fails, { call: [expect, "subtree id", { call: [ufo.object.id_of, sub_raw] }, "00700f640e0f490f6adafacf9e0411e233a06740"] }] }]
+      - decl: [top, list<ufo.object.TreeEntry>]
+      - call: [top.push, { call: [entry, "100755", "run.sh", "04fea06420ca60892f73becee3614f6d023a4b7f"] }]
+      - call: [top.push, { call: [entry, "40000", "a", "00700f640e0f490f6adafacf9e0411e233a06740"] }]
+      - call: [top.push, { call: [entry, "120000", "link", "04fea06420ca60892f73becee3614f6d023a4b7f"] }]
+      - call: [top.push, { call: [entry, "100644", "a.txt", "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"] }]
+      - decl: [tree_body, buffer<u8>, { call: [ufo.object.tree_encode, top] }]
+      - decl: [tree_raw, buffer<u8>, { call: [ufo.object.frame, "tree", tree_body] }]
+      - set: [fails, { +: [fails, { call: [expect, "tree id", { call: [ufo.object.id_of, tree_raw] }, "a4933e75718c52b00d5a9c96c5ff2eeacefeef16"] }] }]
+      - decl: [parsed, list<ufo.object.TreeEntry>, { call: [ufo.object.tree_decode, tree_body] }]
+      - decl: [order, string, ""]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, parsed.len] }
+          body:
+            - decl: [one, ufo.object.TreeEntry, { at: [parsed, idx] }]
+            - set: [order, "${order}${one.name}:${one.mode} "]
+            - set: [idx, { +: [idx, 1] }]
+      - set: [fails, { +: [fails, { call: [expect, "tree decode", order, "a.txt:100644 a:40000 link:120000 run.sh:100755 "] }] }]
+      # commit
+      - decl: [cmt, ufo.object.Commit]
+      - set: [cmt.tree, "a4933e75718c52b00d5a9c96c5ff2eeacefeef16"]
+      - set: [cmt.author, { call: [ufo.object.signature, "ufo", "ufo@example.org", 1700000000] }]
+      - set: [cmt.committer, cmt.author]
+      - set: [cmt.message, "layer build\n"]
+      - decl: [cmt_body, buffer<u8>, { call: [ufo.object.commit_encode, cmt] }]
+      - decl: [cmt_raw, buffer<u8>, { call: [ufo.object.frame, "commit", cmt_body] }]
+      - set: [fails, { +: [fails, { call: [expect, "commit id", { call: [ufo.object.id_of, cmt_raw] }, "621964a03cd1156c101acf9cf8da5cb6e8632b7f"] }] }]
+      - decl: [again, ufo.object.Commit, { call: [ufo.object.commit_decode, cmt_body] }]
+      - set: [fails, { +: [fails, { call: [expect, "commit decode tree", again.tree, cmt.tree] }] }]
+      - set: [fails, { +: [fails, { call: [expect, "commit decode message", again.message, "layer build\n"] }] }]
+      - if:
+          condition: { gt: [fails, 0] }
+          then:
+            - return: [1]
+      - print: ["PASS object: blob/tree/commit ids equal git's, tree order, decode"]
+      - return: [0]

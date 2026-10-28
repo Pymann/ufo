@@ -1,0 +1,100 @@
+# ufo.walk — which objects a set of commits needs (for push and pack-objects).
+#
+# Walker.mark(tips) records every object reachable from `tips` as known
+# (typically: what the other side already has); Walker.collect(tips) lists the
+# objects reachable from `tips` that are not known — commits, their trees,
+# blobs and annotated tags, each once.  Objects missing locally stop the walk
+# (a shallow or partial clone is not an error here).
+
+- namespace: ufo.walk
+
+- import: "object.aiml"
+- import: "repo.aiml"
+
+- class:
+    name: Walker
+    members:
+      - [seen, map<string:i32>]
+      - [found, list<string>, null, { access: public }]
+      - [collecting, i32, 0]
+    methods:
+      - def:
+          name: mark
+          args: [[repo, ref<ufo.repo.Repository>], [tips, list<string>]]
+          body:
+            - set: [<.collecting, 0]
+            - call: [<.walk, repo, tips]
+
+      - def:
+          name: collect
+          args: [[repo, ref<ufo.repo.Repository>], [tips, list<string>]]
+          return: list<string>
+          body:
+            - decl: [fresh, list<string>]
+            - set: [<.found, fresh]
+            - set: [<.collecting, 1]
+            - call: [<.walk, repo, tips]
+            - return: [<.found]
+
+      - def:
+          name: visit
+          args: [[oid, string]]
+          return: i32
+          body:
+            - if: { condition: { neq: [oid.len, 40] }, then: [{ return: [0] }] }
+            - if: { condition: { eq: [{ call: [<.seen.contains, oid] }, 1] }, then: [{ return: [0] }] }
+            - call: [<.seen.put, oid, 1]
+            - return: [1]
+
+      # Iterative walk with an explicit stack (deep histories would overflow recursion).
+      - def:
+          name: walk
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [tips, list<string>]]
+          body:
+            - decl: [stack, list<string>]
+            - decl: [tdx, i32, 0]
+            - while:
+                condition: { lt: [tdx, tips.len] }
+                body:
+                  - call: [stack.push, { call: [tips.get, tdx] }]
+                  - set: [tdx, { +: [tdx, 1] }]
+            - while:
+                condition: { gt: [stack.len, 0] }
+                body:
+                  - decl: [oid, string, { call: [stack.get, { -: [stack.len, 1] }] }]
+                  - call: [stack.remove, { -: [stack.len, 1] }]
+                  - if:
+                      condition: { eq: [{ call: [<.visit, oid] }, 1] }
+                      then:
+                        - decl: [raw, buffer<u8>, { call: [repo.read_raw, oid] }]
+                        - decl: [kind, string, { call: [ufo.object.kind_of, raw] }]
+                        - decl: [body, buffer<u8>, { call: [ufo.object.body_of, raw] }]
+                        - if: { condition: { and: [{ eq: [<.collecting, 1] }, { gt: [raw.len, 0] }] }, then: [{ call: [<.found.push, oid] }] }
+                        - if:
+                            condition: { eq: [kind, "commit"] }
+                            then:
+                              - decl: [cmt, ufo.object.Commit, { call: [ufo.object.commit_decode, body] }]
+                              - call: [stack.push, cmt.tree]
+                              - decl: [pdx, i32, 0]
+                              - while:
+                                  condition: { lt: [pdx, cmt.parents.len] }
+                                  body:
+                                    - call: [stack.push, { call: [cmt.parents.get, pdx] }]
+                                    - set: [pdx, { +: [pdx, 1] }]
+                        - if:
+                            condition: { eq: [kind, "tree"] }
+                            then:
+                              - decl: [entries, list<ufo.object.TreeEntry>, { call: [ufo.object.tree_decode, body] }]
+                              - decl: [edx, i32, 0]
+                              - while:
+                                  condition: { lt: [edx, entries.len] }
+                                  body:
+                                    - decl: [ent, ufo.object.TreeEntry, { at: [entries, edx] }]
+                                    - if: { condition: { neq: [ent.mode, "160000"] }, then: [{ call: [stack.push, ent.oid] }] }
+                                    - set: [edx, { +: [edx, 1] }]
+                        - if:
+                            condition: { eq: [kind, "tag"] }
+                            then:
+                              - decl: [text, string, { call: [bytes.text, body] }]
+                              - if: { condition: { eq: [{ call: [text.starts_with, "object "] }, 1] }, then: [{ call: [stack.push, { call: [text.substr, 7, 40] }] }] }

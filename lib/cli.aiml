@@ -1,0 +1,671 @@
+# ufo.cli — the command line.
+#
+#   ufo [-C <dir>] <command> [args]
+#
+# git plumbing (works on any git repository, writes what git reads):
+#   init [--bare] [<dir>]            create a repository (branch main)
+#   hash-object [-w] <file>          blob id of a file (-w: store it)
+#   cat-file (-t|-s|-p|<kind>) <obj> kind / size / pretty / raw body
+#   write-tree <dir>                 snapshot a directory, print the tree id
+#   ls-tree <tree>                   list a tree
+#   checkout-tree <tree> <dir>       write a tree into a directory
+#   commit-tree <tree> [-p <parent>]… -m <message>
+#   update-ref <ref> <obj>           point a ref at an object
+#   rev-parse <name>                 resolve HEAD / a ref / an id
+#   show-ref                         all refs
+#   log [<ref>]                      first-parent history
+#   pack-objects <base> <obj>…       write <base>.pack (+ .idx) with these objects
+#   index-pack <file.pack>           write the .idx for a pack
+#   verify-pack <base>               read every object of a pack back and check its id
+#
+# Layers and remotes have their own commands (see README).
+
+- namespace: ufo.cli
+
+- import: "object.aiml"
+- import: "repo.aiml"
+- import: "worktree.aiml"
+- import: "packwrite.aiml"
+- import: "remote.aiml"
+
+- class:
+    name: Cli
+    members:
+      - [args, list<string>, null, { access: public }]
+      - [dir, string, "."]
+      - [repo, ptr<ufo.repo.Repository>, null]
+      - [head_branch, string, ""]
+    methods:
+      # Collects argv (after the program name).
+      - def:
+          name: load_args
+          body:
+            - decl: [idx, i32, 1]
+            - decl: [more, i32, 1]
+            - while:
+                condition: { and: [{ eq: [more, 1] }, { lt: [idx, 256] }] }
+                body:
+                  - decl: [one, string, { call: [sys.get_arg, idx] }]
+                  - if:
+                      condition: { or: [{ eq: [one, null] }, { eq: [one.len, 0] }] }
+                      then: [{ set: [more, 0] }]
+                      else: [{ call: [<.args.push, one] }]
+                  - set: [idx, { +: [idx, 1] }]
+
+      - def:
+          name: arg
+          args: [[pos, i32]]
+          return: string
+          body:
+            - if: { condition: { ge: [pos, <.args.len] }, then: [{ return: [""] }] }
+            - return: [{ call: [<.args.get, pos] }]
+
+      - def:
+          name: fail
+          args: [[message, string]]
+          return: i32
+          body:
+            - call: [log.error, "ufo: ${message}"]
+            - return: [1]
+
+      - def:
+          name: open_repo
+          return: i32
+          body:
+            - set: [<.repo, { new: ufo.repo.Repository }]
+            - return: [{ call: [<.repo.open, <.dir] }]
+
+      - def:
+          name: run
+          static_off: ["str_cmp"]
+          return: i32
+          body:
+            - call: [<.load_args]
+            - decl: [pos, i32, 0]
+            - if:
+                condition: { eq: [{ call: [<.arg, 0] }, "-C"] }
+                then:
+                  - set: [<.dir, { call: [<.arg, 1] }]
+                  - set: [pos, 2]
+            - decl: [cmd, string, { call: [<.arg, pos] }]
+            - if: { condition: { eq: [cmd, "init"] }, then: [{ return: [{ call: [<.cmd_init, { +: [pos, 1] }] }] }] }
+            - if: { condition: { eq: [cmd, "clone"] }, then: [{ return: [{ call: [<.cmd_clone, { +: [pos, 1] }] }] }] }
+            - if: { condition: { eq: [cmd, "ls-remote"] }, then: [{ return: [{ call: [<.cmd_ls_remote, { +: [pos, 1] }] }] }] }
+            - if:
+                condition: { eq: [{ call: [<.open_repo] }, 0] }
+                then:
+                  - if: { condition: { eq: [cmd.len, 0] }, then: [{ return: [{ call: [<.fail, "usage: ufo [-C <dir>] <command> …"] }] }] }
+                  - return: [{ call: [<.fail, "not a git repository: ${<.dir}"] }]
+            - decl: [first, i32, { +: [pos, 1] }]
+            - if: { condition: { eq: [cmd, "hash-object"] }, then: [{ return: [{ call: [<.cmd_hash_object, first] }] }] }
+            - if: { condition: { eq: [cmd, "cat-file"] }, then: [{ return: [{ call: [<.cmd_cat_file, first] }] }] }
+            - if: { condition: { eq: [cmd, "write-tree"] }, then: [{ return: [{ call: [<.cmd_write_tree, first] }] }] }
+            - if: { condition: { eq: [cmd, "ls-tree"] }, then: [{ return: [{ call: [<.cmd_ls_tree, first] }] }] }
+            - if: { condition: { eq: [cmd, "checkout-tree"] }, then: [{ return: [{ call: [<.cmd_checkout_tree, first] }] }] }
+            - if: { condition: { eq: [cmd, "commit-tree"] }, then: [{ return: [{ call: [<.cmd_commit_tree, first] }] }] }
+            - if: { condition: { eq: [cmd, "update-ref"] }, then: [{ return: [{ call: [<.cmd_update_ref, first] }] }] }
+            - if: { condition: { eq: [cmd, "rev-parse"] }, then: [{ return: [{ call: [<.cmd_rev_parse, first] }] }] }
+            - if: { condition: { eq: [cmd, "show-ref"] }, then: [{ return: [{ call: [<.cmd_show_ref] }] }] }
+            - if: { condition: { eq: [cmd, "log"] }, then: [{ return: [{ call: [<.cmd_log, first] }] }] }
+            - if: { condition: { eq: [cmd, "pack-objects"] }, then: [{ return: [{ call: [<.cmd_pack_objects, first] }] }] }
+            - if: { condition: { eq: [cmd, "index-pack"] }, then: [{ return: [{ call: [<.cmd_index_pack, first] }] }] }
+            - if: { condition: { eq: [cmd, "verify-pack"] }, then: [{ return: [{ call: [<.cmd_verify_pack, first] }] }] }
+            - if: { condition: { eq: [cmd, "remote"] }, then: [{ return: [{ call: [<.cmd_remote, first] }] }] }
+            - if: { condition: { eq: [cmd, "fetch"] }, then: [{ return: [{ call: [<.cmd_fetch, first] }] }] }
+            - if: { condition: { eq: [cmd, "push"] }, then: [{ return: [{ call: [<.cmd_push, first] }] }] }
+            - return: [{ call: [<.fail, "unknown command '${cmd}'"] }]
+
+      # ── commands ─────────────────────────────────────────────────────────
+      - def:
+          name: cmd_init
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [bare, i32, 0]
+            - decl: [target, string, <.dir]
+            - decl: [idx, i32, pos]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - decl: [one, string, { call: [<.arg, idx] }]
+                  - if:
+                      condition: { eq: [one, "--bare"] }
+                      then: [{ set: [bare, 1] }]
+                      else: [{ set: [target, one] }]
+                  - set: [idx, { +: [idx, 1] }]
+            - call: [io.mkdir_all, target]
+            - set: [<.repo, { new: ufo.repo.Repository }]
+            - call: [<.repo.create, target, bare, "main"]
+            - print: ["Initialized empty git repository in ${<.repo.git_dir}"]
+            - return: [0]
+
+      - def:
+          name: cmd_hash_object
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [store, i32, 0]
+            - decl: [file_path, string, { call: [<.arg, pos] }]
+            - if:
+                condition: { eq: [file_path, "-w"] }
+                then:
+                  - set: [store, 1]
+                  - set: [file_path, { call: [<.arg, { +: [pos, 1] }] }]
+            - if: { condition: { not: [{ call: [io.is_file, file_path] }] }, then: [{ return: [{ call: [<.fail, "no such file: ${file_path}"] }] }] }
+            - decl: [raw, buffer<u8>, { call: [ufo.object.frame, "blob", { call: [bytes.read_file, file_path] }] }]
+            - if:
+                condition: { eq: [store, 1] }
+                then: [{ print: ["${{ call: [<.repo.write_raw, raw] }}"] }]
+                else: [{ print: ["${{ call: [ufo.object.id_of, raw] }}"] }]
+            - return: [0]
+
+      - def:
+          name: cmd_cat_file
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [mode, string, { call: [<.arg, pos] }]
+            - decl: [name, string, { call: [<.arg, { +: [pos, 1] }] }]
+            - decl: [oid, string, { call: [<.repo.rev, name] }]
+            - decl: [raw, buffer<u8>, { call: [<.repo.read_raw, oid] }]
+            - if: { condition: { eq: [raw.len, 0] }, then: [{ return: [{ call: [<.fail, "no such object: ${name}"] }] }] }
+            - decl: [kind, string, { call: [ufo.object.kind_of, raw] }]
+            - decl: [body, buffer<u8>, { call: [ufo.object.body_of, raw] }]
+            - if: { condition: { eq: [mode, "-t"] }, then: [{ print: ["${kind}"] }, { return: [0] }] }
+            - if: { condition: { eq: [mode, "-s"] }, then: [{ print: ["${body.len}"] }, { return: [0] }] }
+            - if:
+                condition: { and: [{ eq: [mode, "-p"] }, { eq: [kind, "tree"] }] }
+                then:
+                  - call: [<.print_tree, body]
+                  - return: [0]
+            - if: { condition: { and: [{ neq: [mode, "-p"] }, { neq: [mode, kind] }] }, then: [{ return: [{ call: [<.fail, "${oid} is a ${kind}, not a ${mode}"] }] }] }
+            - decl: [out, file_handle, { call: [io.open, "/dev/stdout", "wb"] }]
+            - call: [body.write_to, out]
+            - call: [io.close, out]
+            - return: [0]
+
+      - def:
+          name: print_tree
+          static_off: ["str_cmp"]
+          args: [[body, buffer<u8>]]
+          body:
+            - decl: [entries, list<ufo.object.TreeEntry>, { call: [ufo.object.tree_decode, body] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, entries.len] }
+                body:
+                  - decl: [ent, ufo.object.TreeEntry, { at: [entries, idx] }]
+                  - decl: [kind, string, "blob"]
+                  - decl: [shown_mode, string, ent.mode]
+                  - if: { condition: { eq: [ent.mode, "40000"] }, then: [{ set: [kind, "tree"] }, { set: [shown_mode, "040000"] }] }
+                  - if: { condition: { eq: [ent.mode, "160000"] }, then: [{ set: [kind, "commit"] }] }
+                  - print: ["${shown_mode} ${kind} ${ent.oid}\t${ent.name}"]
+                  - set: [idx, { +: [idx, 1] }]
+
+      - def:
+          name: cmd_write_tree
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [source, string, { call: [<.arg, pos] }]
+            - if: { condition: { not: [{ call: [io.is_dir, source] }] }, then: [{ return: [{ call: [<.fail, "not a directory: ${source}"] }] }] }
+            - decl: [snap, ptr<ufo.worktree.Snapshotter>, { new: ufo.worktree.Snapshotter }]
+            - call: [snap.skip_top.push, ".git"]
+            - print: ["${{ call: [snap.snapshot, <.repo, source, 0] }}"]
+            - return: [0]
+
+      - def:
+          name: cmd_ls_tree
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [oid, string, { call: [<.repo.rev, { call: [<.arg, pos] }] }]
+            - if:
+                condition: { eq: [{ call: [<.repo.kind, oid] }, "commit"] }
+                then:
+                  - decl: [cmt, ufo.object.Commit, { call: [<.repo.read_commit, oid] }]
+                  - set: [oid, cmt.tree]
+            - call: [<.print_tree, { call: [<.repo.read_body, oid] }]
+            - return: [0]
+
+      - def:
+          name: cmd_checkout_tree
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [oid, string, { call: [<.repo.rev, { call: [<.arg, pos] }] }]
+            - if:
+                condition: { eq: [{ call: [<.repo.kind, oid] }, "commit"] }
+                then:
+                  - decl: [cmt, ufo.object.Commit, { call: [<.repo.read_commit, oid] }]
+                  - set: [oid, cmt.tree]
+            - decl: [written, i64, { call: [ufo.worktree.checkout, <.repo, oid, { call: [<.arg, { +: [pos, 1] }] }] }]
+            - if: { condition: { lt: [written, 0] }, then: [{ return: [{ call: [<.fail, "cannot check out ${oid}"] }] }] }
+            - print: ["${written} file(s)"]
+            - return: [0]
+
+      - def:
+          name: cmd_commit_tree
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [cmt, ufo.object.Commit]
+            - set: [cmt.tree, { call: [<.repo.rev, { call: [<.arg, pos] }] }]
+            - decl: [idx, i32, { +: [pos, 1] }]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - decl: [flag, string, { call: [<.arg, idx] }]
+                  - if: { condition: { eq: [flag, "-p"] }, then: [{ call: [cmt.parents.push, { call: [<.repo.rev, { call: [<.arg, { +: [idx, 1] }] }] }] }] }
+                  - if: { condition: { eq: [flag, "-m"] }, then: [{ set: [cmt.message, "${{ call: [<.arg, { +: [idx, 1] }] }}\n"] }] }
+                  - set: [idx, { +: [idx, 2] }]
+            - set: [cmt.author, { call: [ufo.cli.identity, "AUTHOR"] }]
+            - set: [cmt.committer, { call: [ufo.cli.identity, "COMMITTER"] }]
+            - decl: [made, string, { call: [<.repo.write_object, "commit", { call: [ufo.object.commit_encode, cmt] }] }]
+            - print: ["${made}"]
+            - return: [0]
+
+      - def:
+          name: cmd_update_ref
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [oid, string, { call: [<.repo.rev, { call: [<.arg, { +: [pos, 1] }] }] }]
+            - if: { condition: { eq: [oid.len, 0] }, then: [{ return: [{ call: [<.fail, "unknown object"] }] }] }
+            - return: [{ call: [<.repo.update_ref, { call: [<.arg, pos] }, oid] }]
+
+      - def:
+          name: cmd_rev_parse
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [name, string, { call: [<.arg, pos] }]
+            - decl: [oid, string, { call: [<.repo.rev, name] }]
+            - if: { condition: { eq: [oid.len, 0] }, then: [{ return: [{ call: [<.fail, "unknown revision ${name}"] }] }] }
+            - print: ["${oid}"]
+            - return: [0]
+
+      - def:
+          name: cmd_show_ref
+          return: i32
+          body:
+            - decl: [refs, list<ufo.repo.RefEntry>, { call: [<.repo.list_refs, "refs/"] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, refs.len] }
+                body:
+                  - decl: [ent, ufo.repo.RefEntry, { at: [refs, idx] }]
+                  - print: ["${ent.oid} ${ent.name}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [0]
+
+      - def:
+          name: cmd_log
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [start, string, { call: [<.arg, pos] }]
+            - if: { condition: { eq: [start.len, 0] }, then: [{ set: [start, "HEAD"] }] }
+            - decl: [oid, string, { call: [<.repo.rev, start] }]
+            - decl: [shown, i32, 0]
+            - while:
+                condition: { and: [{ eq: [oid.len, 40] }, { lt: [shown, 10000] }] }
+                body:
+                  - decl: [cmt, ufo.object.Commit, { call: [<.repo.read_commit, oid] }]
+                  - if:
+                      condition: { eq: [cmt.valid, 0] }
+                      then: [{ set: [oid, ""] }]
+                      else:
+                        - decl: [subject, string, { call: [cmt.message.trim] }]
+                        - print: ["${oid} ${subject}"]
+                        - set: [shown, { +: [shown, 1] }]
+                        - if:
+                            condition: { eq: [cmt.parents.len, 0] }
+                            then: [{ set: [oid, ""] }]
+                            else: [{ set: [oid, { call: [cmt.parents.get, 0] }] }]
+            - return: [0]
+
+      - def:
+          name: cmd_pack_objects
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [base, string, { call: [<.arg, pos] }]
+            - decl: [oids, list<string>]
+            - decl: [idx, i32, { +: [pos, 1] }]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - call: [oids.push, { call: [<.repo.rev, { call: [<.arg, idx] }] }]
+                  - set: [idx, { +: [idx, 1] }]
+            - decl: [builder, ptr<ufo.packwrite.PackBuilder>, { new: ufo.packwrite.PackBuilder }]
+            - call: [builder.begin, "${base}.pack", oids.len]
+            - decl: [odx, i32, 0]
+            - while:
+                condition: { lt: [odx, oids.len] }
+                body:
+                  - call: [builder.add, { call: [<.repo.read_raw, { call: [oids.get, odx] }] }]
+                  - set: [odx, { +: [odx, 1] }]
+            - decl: [sha, string, { call: [builder.finish] }]
+            - if: { condition: { eq: [sha.len, 0] }, then: [{ return: [{ call: [<.fail, "pack-objects failed"] }] }] }
+            - decl: [indexed, string, { call: [ufo.packwrite.index_pack, base] }]
+            - if: { condition: { eq: [indexed.len, 0] }, then: [{ return: [{ call: [<.fail, "index-pack failed"] }] }] }
+            - print: ["${sha}"]
+            - return: [0]
+
+      - def:
+          name: cmd_index_pack
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [pack_file, string, { call: [<.arg, pos] }]
+            - decl: [base, string, pack_file]
+            - if: { condition: { eq: [{ call: [pack_file.ends_with, ".pack"] }, 1] }, then: [{ set: [base, { call: [pack_file.substr, 0, { -: [pack_file.len, 5] }] }] }] }
+            - decl: [sha, string, { call: [ufo.packwrite.index_pack, base] }]
+            - if: { condition: { eq: [sha.len, 0] }, then: [{ return: [1] }] }
+            - print: ["${sha}"]
+            - return: [0]
+
+      - def:
+          name: cmd_verify_pack
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [base, string, { call: [<.arg, pos] }]
+            - if: { condition: { eq: [{ call: [base.ends_with, ".pack"] }, 1] }, then: [{ set: [base, { call: [base.substr, 0, { -: [base.len, 5] }] }] }] }
+            - decl: [packs, ptr<ufo.pack.PackSet>, { new: ufo.pack.PackSet }]
+            - if: { condition: { neq: [{ call: [packs.add, base] }, 0] }, then: [{ return: [{ call: [<.fail, "cannot open ${base}.pack/.idx"] }] }] }
+            - decl: [listing, list<string>, { call: [packs.ids, 0] }]
+            - decl: [bad, i32, 0]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, listing.len] }
+                body:
+                  - decl: [oid, string, { call: [listing.get, idx] }]
+                  - decl: [raw, buffer<u8>, { call: [packs.read, oid] }]
+                  - decl: [kind, string, { call: [ufo.object.kind_of, raw] }]
+                  - decl: [got, string, { call: [ufo.object.id_of, raw] }]
+                  - if:
+                      condition: { neq: [got, oid] }
+                      then:
+                        - print: ["${oid} BAD (${kind}, got ${got})"]
+                        - set: [bad, { +: [bad, 1] }]
+                      else:
+                        - decl: [body, buffer<u8>, { call: [ufo.object.body_of, raw] }]
+                        - print: ["${oid} ${kind} ${body.len}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - print: ["${listing.len} object(s), ${bad} bad"]
+            - if: { condition: { gt: [bad, 0] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      # ── remotes ──────────────────────────────────────────────────────────
+      # URL for a remote name (from .git/config) or the argument itself.
+      - def:
+          name: remote_url
+          args: [[name, string]]
+          return: string
+          body:
+            - if: { condition: { ge: [{ call: [name.index_of, "://"] }, 0] }, then: [{ return: [name] }] }
+            - if: { condition: { eq: [<.repo, null] }, then: [{ return: [""] }] }
+            - decl: [config, string, { call: [io.read_file, "${<.repo.git_dir}/config"] }]
+            - decl: [lines, list<string>, { call: [config.split, "\n"] }]
+            - decl: [inside, i32, 0]
+            - decl: [found, string, ""]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, lines.len] }
+                body:
+                  - decl: [raw_line, string, { call: [lines.get, idx] }]
+                  - decl: [line, string, { call: [raw_line.trim] }]
+                  - if: { condition: { eq: [{ call: [line.starts_with, "["] }, 1] }, then: [{ set: [inside, 0] }] }
+                  - if: { condition: { eq: [line, "[remote \"${name}\"]"] }, then: [{ set: [inside, 1] }] }
+                  - if:
+                      condition: { and: [{ eq: [inside, 1] }, { eq: [{ call: [line.starts_with, "url"] }, 1] }] }
+                      then:
+                        - decl: [eq_at, i32, { call: [line.index_of, "="] }]
+                        - decl: [value, string, { call: [line.substr, { +: [eq_at, 1] }] }]
+                        - set: [found, { call: [value.trim] }]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [found]
+
+      - def:
+          name: new_remote
+          args: [[url, string]]
+          return: ptr<ufo.remote.Remote>
+          body:
+            - decl: [peer, ptr<ufo.remote.Remote>, { new: ufo.remote.Remote }]
+            - decl: [tmp_dir, string, "/tmp/ufo-${{ call: [math.random_hex, 4] }}"]
+            - if: { condition: { neq: [<.repo, null] }, then: [{ set: [tmp_dir, "${<.repo.git_dir}/ufo-tmp"] }] }
+            - call: [peer.init, url, tmp_dir]
+            - return: [peer]
+
+      - def:
+          name: cmd_remote
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - if:
+                condition: { eq: [{ call: [<.arg, pos] }, "add"] }
+                then:
+                  - decl: [name, string, { call: [<.arg, { +: [pos, 1] }] }]
+                  - decl: [url, string, { call: [<.arg, { +: [pos, 2] }] }]
+                  - if: { condition: { or: [{ eq: [name.len, 0] }, { eq: [url.len, 0] }] }, then: [{ return: [{ call: [<.fail, "usage: ufo remote add <name> <url>"] }] }] }
+                  - decl: [config, string, { call: [io.read_file, "${<.repo.git_dir}/config"] }]
+                  - call: [<.repo.write_text, "${<.repo.git_dir}/config", "${config}[remote \"${name}\"]\n\turl = ${url}\n\tfetch = +refs/heads/*:refs/remotes/${name}/*\n"]
+                  - return: [0]
+            - return: [{ call: [<.fail, "usage: ufo remote add <name> <url>"] }]
+
+      - def:
+          name: cmd_ls_remote
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [maybe, ptr<ufo.repo.Repository>, { new: ufo.repo.Repository }]
+            - if: { condition: { eq: [{ call: [maybe.open, <.dir] }, 1] }, then: [{ set: [<.repo, maybe] }] }
+            - decl: [url, string, { call: [<.remote_url, { call: [<.arg, pos] }] }]
+            - if: { condition: { eq: [url.len, 0] }, then: [{ return: [{ call: [<.fail, "usage: ufo ls-remote <url|remote>"] }] }] }
+            - decl: [peer, ptr<ufo.remote.Remote>, { call: [<.new_remote, url] }]
+            - decl: [refs, list<ufo.repo.RefEntry>, { call: [peer.ls_refs] }]
+            - if: { condition: { gt: [peer.error.len, 0] }, then: [{ return: [{ call: [<.fail, peer.error] }] }] }
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, refs.len] }
+                body:
+                  - decl: [ent, ufo.repo.RefEntry, { at: [refs, idx] }]
+                  - print: ["${ent.oid}\t${ent.name}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [0]
+
+      # Local name for a fetched ref: heads → refs/remotes/<remote>/…, tags and
+      # everything else (refs/layers/…) keep their name.
+      - def:
+          name: tracking_name
+          args: [[remote_name, string], [ref_name, string]]
+          return: string
+          body:
+            - if: { condition: { eq: [{ call: [ref_name.starts_with, "refs/heads/"] }, 1] }, then: [{ return: ["refs/remotes/${remote_name}/${{ call: [ref_name.substr, 11] }}"] }] }
+            - return: [ref_name]
+
+      # Fetches every ref of the remote (or those starting with the given prefixes).
+      - def:
+          name: do_fetch
+          args: [[remote_name, string], [url, string], [prefixes, list<string>]]
+          return: i32
+          body:
+            - decl: [peer, ptr<ufo.remote.Remote>, { call: [<.new_remote, url] }]
+            - decl: [refs, list<ufo.repo.RefEntry>, { call: [peer.ls_refs] }]
+            - if: { condition: { gt: [peer.error.len, 0] }, then: [{ return: [{ call: [<.fail, peer.error] }] }] }
+            - decl: [wants, list<string>]
+            - decl: [chosen, list<ufo.repo.RefEntry>]
+            - decl: [want_seen, map<string:i32>]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, refs.len] }
+                body:
+                  - decl: [ent, ufo.repo.RefEntry, { at: [refs, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [take, i32, 0]
+                  - if: { condition: { eq: [prefixes.len, 0] }, then: [{ set: [take, 1] }] }
+                  - decl: [pdx, i32, 0]
+                  - while:
+                      condition: { lt: [pdx, prefixes.len] }
+                      body:
+                        - if: { condition: { eq: [{ call: [ent.name.starts_with, { call: [prefixes.get, pdx] }] }, 1] }, then: [{ set: [take, 1] }] }
+                        - set: [pdx, { +: [pdx, 1] }]
+                  - if: { condition: { eq: [{ call: [ent.name.starts_with, "refs/"] }, 0] }, then: [{ set: [take, 0] }] }
+                  - if:
+                      condition: { eq: [take, 1] }
+                      then:
+                        - call: [chosen.push, ent]
+                        - if:
+                            condition: { and: [{ eq: [{ call: [<.repo.has, ent.oid] }, 0] }, { eq: [{ call: [want_seen.contains, ent.oid] }, 0] }] }
+                            then:
+                              - call: [wants.push, ent.oid]
+                              - call: [want_seen.put, ent.oid, 1]
+            - decl: [haves, list<string>]
+            - decl: [mine, list<ufo.repo.RefEntry>, { call: [<.repo.list_refs, "refs/"] }]
+            - decl: [mdx, i32, 0]
+            - while:
+                condition: { lt: [mdx, mine.len] }
+                body:
+                  - decl: [own, ufo.repo.RefEntry, { at: [mine, mdx] }]
+                  - if: { condition: { eq: [{ call: [<.repo.has, own.oid] }, 1] }, then: [{ call: [haves.push, own.oid] }] }
+                  - set: [mdx, { +: [mdx, 1] }]
+            - decl: [got, i64, { call: [peer.fetch, <.repo, wants, haves] }]
+            - if: { condition: { lt: [got, 0] }, then: [{ return: [{ call: [<.fail, peer.error] }] }] }
+            - decl: [cdx, i32, 0]
+            - while:
+                condition: { lt: [cdx, chosen.len] }
+                body:
+                  - decl: [ent, ufo.repo.RefEntry, { at: [chosen, cdx] }]
+                  - call: [<.repo.update_ref, { call: [<.tracking_name, remote_name, ent.name] }, ent.oid]
+                  - set: [cdx, { +: [cdx, 1] }]
+            - set: [<.head_branch, peer.head_target]
+            - print: ["fetched ${got} object(s), ${chosen.len} ref(s) from ${url}"]
+            - return: [0]
+
+      - def:
+          name: cmd_fetch
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [name, string, { call: [<.arg, pos] }]
+            - if: { condition: { eq: [name.len, 0] }, then: [{ set: [name, "origin"] }] }
+            - decl: [url, string, { call: [<.remote_url, name] }]
+            - if: { condition: { eq: [url.len, 0] }, then: [{ return: [{ call: [<.fail, "unknown remote '${name}'"] }] }] }
+            - decl: [remote_name, string, name]
+            - if: { condition: { ge: [{ call: [name.index_of, "://"] }, 0] }, then: [{ set: [remote_name, "origin"] }] }
+            - decl: [prefixes, list<string>]
+            - decl: [idx, i32, { +: [pos, 1] }]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - call: [prefixes.push, { call: [<.arg, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [{ call: [<.do_fetch, remote_name, url, prefixes] }]
+
+      - def:
+          name: cmd_clone
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [url, string, { call: [<.arg, pos] }]
+            - decl: [target, string, { call: [<.arg, { +: [pos, 1] }] }]
+            - if: { condition: { or: [{ eq: [url.len, 0] }, { eq: [target.len, 0] }] }, then: [{ return: [{ call: [<.fail, "usage: ufo clone <url> <dir>"] }] }] }
+            - call: [io.mkdir_all, target]
+            - set: [<.repo, { new: ufo.repo.Repository }]
+            - call: [<.repo.create, target, 0, "main"]
+            - decl: [config, string, { call: [io.read_file, "${<.repo.git_dir}/config"] }]
+            - call: [<.repo.write_text, "${<.repo.git_dir}/config", "${config}[remote \"origin\"]\n\turl = ${url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"]
+            - decl: [none, list<string>]
+            - if: { condition: { neq: [{ call: [<.do_fetch, "origin", url, none] }, 0] }, then: [{ return: [1] }] }
+            - decl: [branch, string, <.head_branch]
+            - if: { condition: { eq: [branch.len, 0] }, then: [{ set: [branch, "refs/heads/main"] }] }
+            - decl: [short, string, { call: [branch.substr, 11] }]
+            - decl: [tip, string, { call: [<.repo.resolve, "refs/remotes/origin/${short}"] }]
+            - call: [<.repo.write_text, "${<.repo.git_dir}/HEAD", "ref: ${branch}\n"]
+            - if:
+                condition: { eq: [tip.len, 40] }
+                then:
+                  - call: [<.repo.update_ref, branch, tip]
+                  - decl: [cmt, ufo.object.Commit, { call: [<.repo.read_commit, tip] }]
+                  - decl: [written, i64, { call: [ufo.worktree.checkout, <.repo, cmt.tree, target] }]
+                  - print: ["checked out ${short} (${written} file(s))"]
+            - return: [0]
+
+      # push <remote|url> <src>[:<dst>]…  (":<dst>" deletes; "+" is accepted and ignored)
+      - def:
+          name: cmd_push
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [url, string, { call: [<.remote_url, { call: [<.arg, pos] }] }]
+            - if: { condition: { eq: [url.len, 0] }, then: [{ return: [{ call: [<.fail, "usage: ufo push <remote|url> <src>[:<dst>]…"] }] }] }
+            - decl: [updates, list<ufo.remote.RefUpdate>]
+            - decl: [idx, i32, { +: [pos, 1] }]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - decl: [spec, string, { call: [<.arg, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if: { condition: { eq: [{ call: [spec.starts_with, "+"] }, 1] }, then: [{ set: [spec, { call: [spec.substr, 1] }] }] }
+                  - decl: [colon, i32, { call: [spec.index_of, ":"] }]
+                  - decl: [src, string, spec]
+                  - decl: [dst, string, spec]
+                  - if:
+                      condition: { ge: [colon, 0] }
+                      then:
+                        - set: [src, { call: [spec.substr, 0, colon] }]
+                        - set: [dst, { call: [spec.substr, { +: [colon, 1] }] }]
+                  - if: { condition: { eq: [{ call: [dst.starts_with, "refs/"] }, 0] }, then: [{ set: [dst, "refs/heads/${dst}"] }] }
+                  - decl: [upd, ufo.remote.RefUpdate]
+                  - set: [upd.name, dst]
+                  - set: [upd.new_oid, { call: [ufo.remote.zero_id] }]
+                  - if:
+                      condition: { gt: [src.len, 0] }
+                      then:
+                        - set: [upd.new_oid, { call: [<.repo.rev, src] }]
+                        - if: { condition: { neq: [upd.new_oid.len, 40] }, then: [{ return: [{ call: [<.fail, "unknown revision '${src}'"] }] }] }
+                  - call: [updates.push, upd]
+            - if: { condition: { eq: [updates.len, 0] }, then: [{ return: [{ call: [<.fail, "nothing to push"] }] }] }
+            - decl: [peer, ptr<ufo.remote.Remote>, { call: [<.new_remote, url] }]
+            - decl: [result, list<ufo.remote.RefUpdate>, { call: [peer.push, <.repo, updates] }]
+            - if: { condition: { gt: [peer.error.len, 0] }, then: [{ return: [{ call: [<.fail, peer.error] }] }] }
+            - decl: [bad, i32, 0]
+            - decl: [rdx, i32, 0]
+            - while:
+                condition: { lt: [rdx, result.len] }
+                body:
+                  - decl: [one, ufo.remote.RefUpdate, { at: [result, rdx] }]
+                  - if: { condition: { neq: [one.status, "ok"] }, then: [{ set: [bad, { +: [bad, 1] }] }] }
+                  - print: ["${one.status} ${one.name} ${one.reason}"]
+                  - set: [rdx, { +: [rdx, 1] }]
+            - if: { condition: { gt: [bad, 0] }, then: [{ return: [1] }] }
+            - return: [0]
+
+# "Name <mail> <seconds> +0000" from UFO_/GIT_<ROLE>_NAME/EMAIL, else ufo defaults.
+- def:
+    name: identity
+    args: [[role, string]]
+    return: string
+    body:
+      - decl: [envm, map<string:string>, { call: [sys.env] }]
+      - decl: [who, string, "ufo"]
+      - decl: [mail, string, "ufo@localhost"]
+      - if: { condition: { eq: [{ call: [envm.contains, "GIT_${role}_NAME"] }, 1] }, then: [{ set: [who, { call: [envm.get, "GIT_${role}_NAME"] }] }] }
+      - if: { condition: { eq: [{ call: [envm.contains, "GIT_${role}_EMAIL"] }, 1] }, then: [{ set: [mail, { call: [envm.get, "GIT_${role}_EMAIL"] }] }] }
+      - decl: [seconds, i64, { '/': [{ call: [time.now] }, 1000] }]
+      - if:
+          condition: { eq: [{ call: [envm.contains, "GIT_${role}_DATE"] }, 1] }
+          then:
+            # only "<seconds> +0000" is understood here
+            - decl: [stamp, string, { call: [envm.get, "GIT_${role}_DATE"] }]
+            - decl: [parts, list<string>, { call: [stamp.split, " "] }]
+            - decl: [secs_txt, string, { call: [parts.get, 0] }]
+            - set: [seconds, { call: [secs_txt.to_int] }]
+      - return: [{ call: [ufo.object.signature, who, mail, seconds] }]

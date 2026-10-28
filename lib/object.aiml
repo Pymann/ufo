@@ -1,0 +1,232 @@
+# ufo.object — git objects: framing, ids, trees, commits (git's own format).
+#
+# A raw object is "<kind> <size>\0<body>"; its id is sha1(raw) in hex.  Loose
+# objects on disk are zlib(raw).  Trees are binary ("<mode> <name>\0" + 20 raw
+# id bytes per entry, sorted git's way); commits and tags are text.
+#
+# Everything here is pure: no files, no network.
+
+- namespace: ufo.object
+
+- model:
+    name: TreeEntry
+    fields:
+      - [mode, string, ""]     # "100644" file, "100755" executable, "120000" symlink, "40000" tree, "160000" gitlink
+      - [name, string, ""]
+      - [oid, string, ""]      # object id, 40 hex
+
+- model:
+    name: Commit
+    fields:
+      - [valid, i32, 0]
+      - [tree, string, ""]
+      - [parents, list<string>]
+      - [author, string, ""]       # "Name <mail> <unix-seconds> <+hhmm>"
+      - [committer, string, ""]
+      - [extra, list<string>]      # further header lines, verbatim (e.g. encoding, gpgsig with continuation lines)
+      - [message, string, ""]
+
+# "<kind> <len>\0<body>"
+- def:
+    name: frame
+    args: [[kind, string], [body, buffer<u8>]]
+    return: buffer<u8>
+    body:
+      - decl: [head, buffer<u8>, { call: [bytes.from_string, "${kind} ${body.len}"] }]
+      - decl: [nul, buffer<u8>, { call: [bytes.from_u8, 0] }]
+      - decl: [with_nul, buffer<u8>, { call: [bytes.concat, head, nul] }]
+      - return: [{ call: [bytes.concat, with_nul, body] }]
+
+- def:
+    name: id_of
+    args: [[raw, buffer<u8>]]
+    return: string
+    body:
+      - return: [{ call: [hash.sha1, raw] }]
+
+# Kind of a raw object ("blob", "tree", "commit", "tag"), "" when malformed.
+- def:
+    name: kind_of
+    args: [[raw, buffer<u8>]]
+    return: string
+    body:
+      - decl: [space, i64, { call: [bytes.find, raw, 32, 0] }]
+      - if:
+          condition: { or: [{ lt: [space, 1] }, { gt: [space, 6] }] }
+          then:
+            - return: [""]
+      - return: [{ call: [bytes.text, raw, 0, space] }]
+
+# Body of a raw object; empty when malformed or when the size header lies.
+- def:
+    name: body_of
+    args: [[raw, buffer<u8>]]
+    return: buffer<u8>
+    body:
+      - decl: [nul, i64, { call: [bytes.find, raw, 0, 0] }]
+      - if:
+          condition: { lt: [nul, 0] }
+          then:
+            - return: [{ call: [bytes.from_string, ""] }]
+      - decl: [space, i64, { call: [bytes.find, raw, 32, 0] }]
+      - decl: [size_txt, string, { call: [bytes.text, raw, { +: [space, 1] }, { -: [{ -: [nul, space] }, 1] }] }]
+      - decl: [size, i64, { call: [size_txt.to_int] }]
+      - decl: [body, buffer<u8>, { call: [bytes.slice, raw, { +: [nul, 1] }] }]
+      - if:
+          condition: { neq: [body.len, size] }
+          then:
+            - return: [{ call: [bytes.from_string, ""] }]
+      - return: [body]
+
+# ── trees ────────────────────────────────────────────────────────────────────
+# Git orders tree entries by name, with a tree's name compared as "name/".
+- def:
+    name: sort_key
+    args: [[entry, ufo.object.TreeEntry]]
+    return: string
+    body:
+      - if:
+          condition: { eq: [entry.mode, "40000"] }
+          then:
+            - return: ["${entry.name}/"]
+      - return: [entry.name]
+
+- def:
+    name: tree_encode
+    args: [[entries, list<ufo.object.TreeEntry>]]
+    return: buffer<u8>
+    body:
+      - decl: [keys, list<string>]
+      - decl: [by_key, map<string:i32>]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, entries.len] }
+          body:
+            - decl: [one, ufo.object.TreeEntry, { at: [entries, idx] }]
+            - decl: [key, string, { call: [ufo.object.sort_key, one] }]
+            - call: [keys.push, key]
+            - call: [by_key.put, key, idx]
+            - set: [idx, { +: [idx, 1] }]
+      - call: [keys.sort]
+      - decl: [out, buffer<u8>, { call: [bytes.from_string, ""] }]
+      - decl: [nul, buffer<u8>, { call: [bytes.from_u8, 0] }]
+      - decl: [kdx, i32, 0]
+      - while:
+          condition: { lt: [kdx, keys.len] }
+          body:
+            - decl: [pos, i32, { call: [by_key.get, { call: [keys.get, kdx] }] }]
+            - decl: [ent, ufo.object.TreeEntry, { at: [entries, pos] }]
+            - decl: [head, buffer<u8>, { call: [bytes.from_string, "${ent.mode} ${ent.name}"] }]
+            - decl: [raw_id, buffer<u8>, { call: [bytes.from_hex, ent.oid] }]
+            - set: [out, { call: [bytes.concat, out, head] }]
+            - set: [out, { call: [bytes.concat, out, nul] }]
+            - set: [out, { call: [bytes.concat, out, raw_id] }]
+            - set: [kdx, { +: [kdx, 1] }]
+      - return: [out]
+
+- def:
+    name: tree_decode
+    args: [[body, buffer<u8>]]
+    return: list<ufo.object.TreeEntry>
+    body:
+      - decl: [out, list<ufo.object.TreeEntry>]
+      - decl: [pos, i64, 0]
+      - while:
+          condition: { lt: [pos, body.len] }
+          body:
+            - decl: [space, i64, { call: [bytes.find, body, 32, pos] }]
+            - decl: [nul, i64, { call: [bytes.find, body, 0, pos] }]
+            - if:
+                condition: { or: [{ lt: [space, 0] }, { or: [{ lt: [nul, space] }, { gt: [{ +: [nul, 21] }, body.len] }] }] }
+                then:
+                  - return: [out]
+            - decl: [ent, ufo.object.TreeEntry]
+            - set: [ent.mode, { call: [bytes.text, body, pos, { -: [space, pos] }] }]
+            - set: [ent.name, { call: [bytes.text, body, { +: [space, 1] }, { -: [{ -: [nul, space] }, 1] }] }]
+            - set: [ent.oid, { call: [bytes.to_hex, body, { +: [nul, 1] }, 20] }]
+            - call: [out.push, ent]
+            - set: [pos, { +: [nul, 21] }]
+      - return: [out]
+
+# ── commits ──────────────────────────────────────────────────────────────────
+- def:
+    name: commit_encode
+    args: [[cmt, ufo.object.Commit]]
+    return: buffer<u8>
+    body:
+      - decl: [text, string, "tree ${cmt.tree}\n"]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, cmt.parents.len] }
+          body:
+            - set: [text, "${text}parent ${{ call: [cmt.parents.get, idx] }}\n"]
+            - set: [idx, { +: [idx, 1] }]
+      - set: [text, "${text}author ${cmt.author}\ncommitter ${cmt.committer}\n"]
+      - decl: [edx, i32, 0]
+      - while:
+          condition: { lt: [edx, cmt.extra.len] }
+          body:
+            - set: [text, "${text}${{ call: [cmt.extra.get, edx] }}\n"]
+            - set: [edx, { +: [edx, 1] }]
+      - set: [text, "${text}\n${cmt.message}"]
+      - return: [{ call: [bytes.from_string, text] }]
+
+- def:
+    name: commit_decode
+    args: [[body, buffer<u8>]]
+    return: ufo.object.Commit
+    body:
+      - decl: [cmt, ufo.object.Commit]
+      - decl: [text, string, { call: [bytes.text, body] }]
+      - decl: [split_at, i32, { call: [text.index_of, "\n\n"] }]
+      - if:
+          condition: { lt: [split_at, 0] }
+          then:
+            - return: [cmt]
+      - decl: [head, string, { call: [text.substr, 0, split_at] }]
+      - set: [cmt.message, { call: [text.substr, { +: [split_at, 2] }] }]
+      - decl: [lines, list<string>, { call: [head.split, "\n"] }]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, lines.len] }
+          body:
+            - decl: [line, string, { call: [lines.get, idx] }]
+            - decl: [handled, i32, 0]
+            - if:
+                condition: { eq: [{ call: [line.starts_with, "tree "] }, 1] }
+                then:
+                  - set: [cmt.tree, { call: [line.substr, 5] }]
+                  - set: [handled, 1]
+            - if:
+                condition: { eq: [{ call: [line.starts_with, "parent "] }, 1] }
+                then:
+                  - call: [cmt.parents.push, { call: [line.substr, 7] }]
+                  - set: [handled, 1]
+            - if:
+                condition: { eq: [{ call: [line.starts_with, "author "] }, 1] }
+                then:
+                  - set: [cmt.author, { call: [line.substr, 7] }]
+                  - set: [handled, 1]
+            - if:
+                condition: { eq: [{ call: [line.starts_with, "committer "] }, 1] }
+                then:
+                  - set: [cmt.committer, { call: [line.substr, 10] }]
+                  - set: [handled, 1]
+            - if:
+                condition: { eq: [handled, 0] }
+                then:
+                  - call: [cmt.extra.push, line]
+            - set: [idx, { +: [idx, 1] }]
+      - if:
+          condition: { eq: [cmt.tree.len, 40] }
+          then:
+            - set: [cmt.valid, 1]
+      - return: [cmt]
+
+# "Name <mail> <seconds> +0000"
+- def:
+    name: signature
+    args: [[who, string], [mail, string], [seconds, i64]]
+    return: string
+    body:
+      - return: ["${who} <${mail}> ${seconds} +0000"]
