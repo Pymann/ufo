@@ -1,0 +1,227 @@
+# ufo.kit.TarApplier — OCI layer tars onto a rootfs (doc/kit.md §2.3).
+#
+# Each layer is walked twice by ufo.tarlayer.read_tar: pass 0 applies only the
+# markers (an opaque dir loses its lower content, `.wh.<name>` removes
+# <name>), pass 1 writes the entries.  So the result does not depend on where
+# a marker sits in the tar.  Markers never reach the rootfs.  Owners, device
+# nodes and xattrs are applied when permitted (root / user namespace) and
+# otherwise skipped with one warning each.  Paths with `..` and writes through
+# a symlinked parent are refused.  Directory mtimes are set by `finish`.
+- namespace: ufo.kit
+
+- import: "../tarlayer.aiml"
+
+- class:
+    name: TarApplier
+    implements: [ufo.tarlayer.TarSink]
+    members:
+      - [root, string, ""]
+      - [phase, i32, 0]
+      - [error, string, "", { access: public }]
+      - [owners, i32, 1]          # 0 after the first refused chown
+      - [devices, i32, 1]         # 0 after the first refused mknod
+      - [dir_keys, list<string>]  # depth keys of the directories written
+      - [dir_mtime, map<string:i64>]
+    methods:
+      # Applies the uncompressed layer tar `tar` onto `rootfs`.  0 or 1 (+ error).
+      - def:
+          name: apply
+          args: [[tar, string], [rootfs, string]]
+          return: i32
+          body:
+            - set: [<.root, rootfs]
+            - set: [<.phase, 0]
+            - decl: [err, string, { call: [ufo.tarlayer.read_tar, tar, this] }]
+            - if:
+                condition: { eq: [err.len, 0] }
+                then:
+                  - set: [<.phase, 1]
+                  - set: [err, { call: [ufo.tarlayer.read_tar, tar, this] }]
+            - if:
+                condition: { gt: [err.len, 0] }
+                then:
+                  - if: { condition: { eq: [<.error.len, 0] }, then: [{ set: [<.error, err] }] }
+                  - return: [1]
+            - return: [0]
+
+      # Directory mtimes, deepest first (writing a child changes its parent's).
+      - def:
+          name: finish
+          body:
+            - call: [<.dir_keys.sort]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, <.dir_keys.len] }
+                body:
+                  - decl: [key, string, { call: [<.dir_keys.get, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [rel, string, { call: [key.substr, 6] }]
+                  - call: [fsmeta.set_mtime, { call: [<.at, rel] }, { call: [<.dir_mtime.get, rel] }, 0]
+
+      - def:
+          name: at
+          args: [[rel, string]]
+          return: string
+          body:
+            - if: { condition: { eq: [rel.len, 0] }, then: [{ return: [<.root] }] }
+            - return: ["${<.root}/${rel}"]
+
+      # No `..` component, and no parent inside the rootfs is a symlink.
+      - def:
+          name: safe
+          static_off: ["str_cmp"]
+          args: [[rel, string]]
+          return: i32
+          body:
+            - decl: [parts, list<string>, { call: [rel.split, "/"] }]
+            - decl: [sofar, string, ""]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, parts.len] }
+                body:
+                  - decl: [part, string, { call: [parts.get, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if: { condition: { eq: [part, ".."] }, then: [{ return: [0] }] }
+                  - if:
+                      condition: { lt: [idx, parts.len] }
+                      then:
+                        - if: { condition: { eq: [sofar.len, 0] }, then: [{ set: [sofar, part] }], else: [{ set: [sofar, "${sofar}/${part}"] }] }
+                        - if: { condition: { eq: [{ call: [io.is_symlink, { call: [<.at, sofar] }] }, 1] }, then: [{ return: [0] }] }
+            - return: [1]
+
+      # Removes whatever is at `full` (a dangling symlink too).
+      - def:
+          name: clear
+          args: [[full, string]]
+          body:
+            - if: { condition: { or: [{ call: [io.exists, full] }, { eq: [{ call: [io.is_symlink, full] }, 1] }] }, then: [{ call: [io.remove_all, full] }] }
+
+      # Pass 0: the markers of one entry.
+      - def:
+          name: marker
+          static_off: ["str_cmp"]
+          args: [[rel, string]]
+          body:
+            - decl: [par, string, { call: [ufo.tarlayer.parent_of, rel] }]
+            - decl: [base, string, { call: [ufo.tarlayer.base_of, rel] }]
+            - if:
+                condition: { eq: [base, ".wh..wh..opq"] }
+                then:
+                  - decl: [dir, string, { call: [<.at, par] }]
+                  - if:
+                      condition: { and: [{ call: [io.is_dir, dir] }, { eq: [{ call: [io.is_symlink, dir] }, 0] }] }
+                      then:
+                        - decl: [kids, list<path>, { call: [io.list_dir, dir] }]
+                        - decl: [idx, i32, 0]
+                        - while:
+                            condition: { lt: [idx, kids.len] }
+                            body:
+                              - decl: [kid, string, { at: [kids, idx] }]
+                              - set: [idx, { +: [idx, 1] }]
+                              - call: [<.clear, kid]
+                  - return: []
+            - if:
+                condition: { eq: [{ call: [base.starts_with, ".wh."] }, 1] }
+                then:
+                  - decl: [gone, string, { call: [base.substr, 4] }]
+                  - if: { condition: { eq: [par.len, 0] }, then: [{ call: [<.clear, { call: [<.at, gone] }] }], else: [{ call: [<.clear, { call: [<.at, "${par}/${gone}"] }] }] }
+
+      - def:
+          name: take
+          static_off: ["str_cmp"]
+          args: [[src, string], [ent, ref<ufo.tarlayer.TarEntry>]]
+          return: i32
+          body:
+            - decl: [rel, string, ent.rel]
+            - if: { condition: { eq: [rel.len, 0] }, then: [{ return: [0] }] }
+            - if:
+                condition: { eq: [{ call: [<.safe, rel] }, 0] }
+                then:
+                  - call: [log.warn, "ufo: ${rel}: unsafe path in the layer — skipped"]
+                  - return: [0]
+            - decl: [base, string, { call: [ufo.tarlayer.base_of, rel] }]
+            - decl: [is_marker, i32, { call: [base.starts_with, ".wh."] }]
+            - if:
+                condition: { eq: [<.phase, 0] }
+                then:
+                  - if: { condition: { eq: [is_marker, 1] }, then: [{ call: [<.marker, rel] }] }
+                  - return: [0]
+            - if: { condition: { eq: [is_marker, 1] }, then: [{ return: [0] }] }
+            - decl: [full, string, { call: [<.at, rel] }]
+            - decl: [flag, i32, ent.flag]
+            - decl: [perm, i64, { band: [ent.mode, 4095] }]
+            - call: [io.mkdir_all, { call: [<.at, { call: [ufo.tarlayer.parent_of, rel] }] }]
+            # 5 directory: an existing directory stays (its content is the lower layer's)
+            - if:
+                condition: { eq: [flag, 53] }
+                then:
+                  - if: { condition: { or: [{ not: [{ call: [io.is_dir, full] }] }, { eq: [{ call: [io.is_symlink, full] }, 1] }] }, then: [{ call: [<.clear, full] }, { call: [io.mkdir_all, full] }] }
+                  - if: { condition: { eq: [{ call: [<.dir_mtime.contains, rel] }, 0] }, then: [{ call: [<.dir_keys.push, { call: [ufo.tarlayer.depth_key, rel] }] }] }
+                  - call: [<.dir_mtime.put, rel, ent.mtime]
+                else:
+                  - call: [<.clear, full]
+                  - decl: [made, i32, 0]
+                  - if:
+                      condition: { or: [{ or: [{ eq: [flag, 48] }, { eq: [flag, 0] }] }, { eq: [flag, 55] }] }
+                      then:
+                        - if:
+                            condition: { lt: [{ call: [bytes.copy_range, src, ent.body_at, ent.size, full] }, 0] }
+                            then:
+                              - set: [<.error, "cannot write ${full}"]
+                              - return: [1]
+                        - set: [made, 1]
+                  - if:
+                      condition: { eq: [flag, 50] }
+                      then:
+                        - if: { condition: { neq: [{ call: [io.symlink, ent.link, full] }, 0] }, then: [{ set: [<.error, "cannot create the symlink ${full}"] }, { return: [1] }] }
+                        - set: [made, 2]
+                  - if:
+                      condition: { eq: [flag, 49] }
+                      then:
+                        - decl: [target, string, { call: [ufo.tarlayer.clean, ent.link] }]
+                        - if: { condition: { eq: [{ call: [<.safe, target] }, 0] }, then: [{ call: [log.warn, "ufo: ${rel} → ${target}: unsafe hard link — skipped"] }, { return: [0] }] }
+                        - if: { condition: { neq: [{ call: [io.link, { call: [<.at, target] }, full] }, 0] }, then: [{ set: [<.error, "cannot link ${full} to ${target}"] }, { return: [1] }] }
+                        # the target's inode already carries mode, owner, xattrs
+                        - return: [0]
+                  - decl: [kind, i64, 0]
+                  - if: { condition: { eq: [flag, 51] }, then: [{ set: [kind, 8192] }] }
+                  - if: { condition: { eq: [flag, 52] }, then: [{ set: [kind, 24576] }] }
+                  - if: { condition: { eq: [flag, 54] }, then: [{ set: [kind, 4096] }] }
+                  - if:
+                      condition: { gt: [kind, 0] }
+                      then:
+                        - if:
+                            condition: { eq: [{ call: [fsmeta.mknod, full, { bor: [kind, perm] }, ent.dmaj, ent.dmin] }, 0] }
+                            then: [{ set: [made, 3] }]
+                            else:
+                              - if: { condition: { eq: [<.devices, 1] }, then: [{ call: [log.warn, "ufo: cannot create device nodes / fifos here (${rel}) — skipped"] }, { set: [<.devices, 0] }] }
+                              - return: [0]
+                  - if:
+                      condition: { eq: [made, 0] }
+                      then:
+                        - call: [log.warn, "ufo: ${rel}: tar entry type ${flag} not supported — skipped"]
+                        - return: [0]
+            # owner before mode: chown clears setuid/setgid
+            - if:
+                condition: { eq: [<.owners, 1] }
+                then:
+                  - if:
+                      condition: { neq: [{ call: [fsmeta.chown, full, ent.uid, ent.gid] }, 0] }
+                      then:
+                        - if: { condition: { or: [{ neq: [ent.uid, 0] }, { neq: [ent.gid, 0] }] }, then: [{ call: [log.warn, "ufo: cannot set owners here (${rel}) — owners ignored"] }, { set: [<.owners, 0] }] }
+            - if: { condition: { neq: [flag, 50] }, then: [{ call: [fsmeta.chmod, full, perm] }] }
+            - decl: [xdx, i32, 0]
+            - while:
+                condition: { lt: [xdx, ent.xattrs.len] }
+                body:
+                  - decl: [pair, string, { call: [ent.xattrs.get, xdx] }]
+                  - set: [xdx, { +: [xdx, 1] }]
+                  - decl: [cut, i32, { call: [pair.index_of, " "] }]
+                  - decl: [xname, string, { call: [pair.substr, 0, cut] }]
+                  - decl: [xhex, string, { call: [pair.substr, { +: [cut, 1] }] }]
+                  - if:
+                      condition: { and: [{ eq: [{ call: [xname.starts_with, "trusted.overlay."] }, 0] }, { eq: [{ call: [xname.starts_with, "user.overlay."] }, 0] }] }
+                      then:
+                        - if: { condition: { neq: [{ call: [fsmeta.xattr_set, full, xname, { call: [bytes.from_hex, xhex] }] }, 0] }, then: [{ call: [log.warn, "ufo: ${rel}: xattr ${xname} not permitted here — skipped"] }] }
+            - if: { condition: { neq: [flag, 53] }, then: [{ call: [fsmeta.set_mtime, full, ent.mtime, 0] }] }
+            - return: [0]

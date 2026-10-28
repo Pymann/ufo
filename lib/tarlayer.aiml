@@ -133,16 +133,184 @@
             - set: [txt, "0${txt}"]
       - return: ["${txt}:${rel}"]
 
+# One tar entry as the reader hands it to a sink (meta entries already folded
+# in: pax path/linkpath/uid/gid/size, GNU long names, SCHILY.xattr.*).
+- class:
+    name: TarEntry
+    members:
+      - [rel, string, "", { access: public }]       # cleaned path ("" = the root)
+      - [link, string, "", { access: public }]      # symlink / hard link target
+      - [flag, i32, 0, { access: public }]          # type byte ('0' = 48 …)
+      - [mode, i64, 0, { access: public }]
+      - [uid, i64, 0, { access: public }]
+      - [gid, i64, 0, { access: public }]
+      - [dmaj, i64, 0, { access: public }]
+      - [dmin, i64, 0, { access: public }]
+      - [mtime, i64, 0, { access: public }]
+      - [size, i64, 0, { access: public }]
+      - [body_at, i64, 0, { access: public }]       # offset of the content in the tar file
+      - [xattrs, list<string>, null, { access: public }]   # "<name> <hex value>"
+
+# What ufo.tarlayer.read_tar feeds: 0 = go on, anything else stops the walk.
+- interface:
+    name: TarSink
+    methods:
+      - [take, i32, [[src, string], [ent, ref<ufo.tarlayer.TarEntry>]]]
+
+# Reads one pax record block into the pending-overrides map / xattr list.
+- def:
+    name: read_pax
+    static_off: ["str_cmp"]
+    args: [[data, buffer<u8>], [pax, map<string:string>], [xattrs, list<string>]]
+    body:
+      - decl: [pos, i64, 0]
+      - decl: [stop, i64, data.len]
+      - while:
+          condition: { lt: [pos, stop] }
+          body:
+            - decl: [space, i64, { call: [bytes.find, data, 32, pos] }]
+            - if:
+                condition: { or: [{ lt: [space, 0] }, { ge: [space, stop] }] }
+                then: [{ set: [pos, stop] }]
+                else:
+                  - decl: [len_txt, string, { call: [bytes.text, data, pos, { -: [space, pos] }] }]
+                  - decl: [rec_len, i64, { call: [len_txt.to_int] }]
+                  - if:
+                      condition: { or: [{ le: [rec_len, 0] }, { gt: [{ +: [pos, rec_len] }, stop] }] }
+                      then: [{ set: [pos, stop] }]
+                      else:
+                        - decl: [key_at, i64, { +: [space, 1] }]
+                        - decl: [eq_at, i64, { call: [bytes.find, data, 61, key_at] }]
+                        - decl: [rec_end, i64, { -: [{ +: [pos, rec_len] }, 1] }]
+                        - if:
+                            condition: { and: [{ gt: [eq_at, 0] }, { lt: [eq_at, rec_end] }] }
+                            then:
+                              - decl: [key, string, { call: [bytes.text, data, key_at, { -: [eq_at, key_at] }] }]
+                              - decl: [val_at, i64, { +: [eq_at, 1] }]
+                              - if:
+                                  condition: { eq: [{ call: [key.starts_with, "SCHILY.xattr."] }, 1] }
+                                  then:
+                                    - decl: [value, buffer<u8>, { call: [bytes.slice, data, val_at, { -: [rec_end, val_at] }] }]
+                                    - call: [xattrs.push, "${{ call: [key.substr, 13] }} ${{ call: [bytes.to_hex, value] }}"]
+                                  else:
+                                    - call: [pax.put, key, { call: [bytes.text, data, val_at, { -: [rec_end, val_at] }] }]
+                        - set: [pos, { +: [pos, rec_len] }]
+
+# Walks the uncompressed tar file `src` header by header (ustar, pax `x`,
+# GNU `L`/`K`) and hands every real entry to `sink`.  Only headers and meta
+# bodies are read; contents stay in the file (TarEntry.body_at/size).
+# "" when the walk is complete, else the error.
+- def:
+    name: read_tar
+    static_off: ["str_cmp"]
+    args: [[src, string], [sink, ref<ufo.tarlayer.TarSink>]]
+    return: string
+    body:
+      - if: { condition: { not: [{ call: [io.is_file, src] }] }, then: [{ return: ["cannot read ${src}"] }] }
+      - decl: [total, i64, { call: [io.file_size, src] }]
+      - decl: [pos, i64, 0]
+      - decl: [pax, map<string:string>]
+      - decl: [xattrs, list<string>]
+      - decl: [long_name, string, ""]
+      - decl: [long_link, string, ""]
+      - decl: [going, i32, 1]
+      - while:
+          condition: { and: [{ eq: [going, 1] }, { le: [{ +: [pos, 512] }, total] }] }
+          body:
+            - decl: [head, buffer<u8>, { call: [bytes.file_slice, src, pos, 512] }]
+            - if: { condition: { lt: [head.len, 512] }, then: [{ return: ["cannot read ${src} at ${pos}"] }] }
+            - decl: [name, string, { call: [bytes.text, head, 0, 100] }]
+            - if:
+                condition: { eq: [name.len, 0] }
+                then: [{ set: [going, 0] }]
+                else:
+                  - decl: [flag, i32, { call: [bytes.u8, head, 156] }]
+                  - decl: [size, i64, { call: [ufo.tarlayer.number, head, 124, 12] }]
+                  - decl: [link, string, { call: [bytes.text, head, 157, 100] }]
+                  - decl: [magic, string, { call: [bytes.text, head, 257, 5] }]
+                  - if:
+                      condition: { eq: [magic, "ustar"] }
+                      then:
+                        - decl: [prefix, string, { call: [bytes.text, head, 345, 155] }]
+                        - if: { condition: { gt: [prefix.len, 0] }, then: [{ set: [name, "${prefix}/${name}"] }] }
+                  - decl: [body_at, i64, { +: [pos, 512] }]
+                  - if: { condition: { eq: [{ call: [pax.contains, "size"] }, 1] }, then: [{ decl: [pax_size, string, { call: [pax.get, "size"] }] }, { set: [size, { call: [pax_size.to_int] }] }] }
+                  - if: { condition: { gt: [{ +: [body_at, size] }, total] }, then: [{ return: ["truncated tar at ${pos}"] }] }
+                  - decl: [blocks, i64, { '/': [{ +: [size, 511] }, 512] }]
+                  - set: [pos, { +: [body_at, { '*': [blocks, 512] }] }]
+                  # meta entries change the NEXT entry
+                  - decl: [meta, i32, 0]
+                  - if:
+                      condition: { or: [{ or: [{ eq: [flag, 120] }, { eq: [flag, 103] }] }, { or: [{ eq: [flag, 76] }, { eq: [flag, 75] }] }] }
+                      then:
+                        - set: [meta, 1]
+                        - decl: [body, buffer<u8>, { call: [bytes.file_slice, src, body_at, size] }]
+                        - if: { condition: { eq: [flag, 120] }, then: [{ call: [ufo.tarlayer.read_pax, body, pax, xattrs] }] }
+                        - if: { condition: { eq: [flag, 76] }, then: [{ set: [long_name, { call: [bytes.text, body, 0, size] }] }] }
+                        - if: { condition: { eq: [flag, 75] }, then: [{ set: [long_link, { call: [bytes.text, body, 0, size] }] }] }
+                  - if:
+                      condition: { eq: [meta, 0] }
+                      then:
+                        - decl: [ent, ptr<ufo.tarlayer.TarEntry>, { new: ufo.tarlayer.TarEntry }]
+                        - set: [ent.flag, flag]
+                        - set: [ent.size, size]
+                        - set: [ent.body_at, body_at]
+                        - set: [ent.mode, { call: [ufo.tarlayer.number, head, 100, 8] }]
+                        - set: [ent.uid, { call: [ufo.tarlayer.number, head, 108, 8] }]
+                        - set: [ent.gid, { call: [ufo.tarlayer.number, head, 116, 8] }]
+                        - set: [ent.mtime, { call: [ufo.tarlayer.number, head, 136, 12] }]
+                        - set: [ent.dmaj, { call: [ufo.tarlayer.number, head, 329, 8] }]
+                        - set: [ent.dmin, { call: [ufo.tarlayer.number, head, 337, 8] }]
+                        - if: { condition: { gt: [long_name.len, 0] }, then: [{ set: [name, long_name] }] }
+                        - if: { condition: { gt: [long_link.len, 0] }, then: [{ set: [link, long_link] }] }
+                        - if: { condition: { eq: [{ call: [pax.contains, "path"] }, 1] }, then: [{ set: [name, { call: [pax.get, "path"] }] }] }
+                        - if: { condition: { eq: [{ call: [pax.contains, "linkpath"] }, 1] }, then: [{ set: [link, { call: [pax.get, "linkpath"] }] }] }
+                        - if: { condition: { eq: [{ call: [pax.contains, "uid"] }, 1] }, then: [{ decl: [pax_uid, string, { call: [pax.get, "uid"] }] }, { set: [ent.uid, { call: [pax_uid.to_int] }] }] }
+                        - if: { condition: { eq: [{ call: [pax.contains, "gid"] }, 1] }, then: [{ decl: [pax_gid, string, { call: [pax.get, "gid"] }] }, { set: [ent.gid, { call: [pax_gid.to_int] }] }] }
+                        - if:
+                            condition: { eq: [{ call: [pax.contains, "mtime"] }, 1] }
+                            then:
+                              # "1700000000.123" — whole seconds only
+                              - decl: [pax_mt, string, { call: [pax.get, "mtime"] }]
+                              - decl: [dot, i32, { call: [pax_mt.index_of, "."] }]
+                              - if: { condition: { gt: [dot, 0] }, then: [{ set: [pax_mt, { call: [pax_mt.substr, 0, dot] }] }] }
+                              - set: [ent.mtime, { call: [pax_mt.to_int] }]
+                        - set: [ent.rel, { call: [ufo.tarlayer.clean, name] }]
+                        - set: [ent.link, link]
+                        - set: [ent.xattrs, xattrs]
+                        - if: { condition: { neq: [{ call: [sink.take, src, ent] }, 0] }, then: [{ return: ["stopped at ${ent.rel}"] }] }
+                        - decl: [fresh_pax, map<string:string>]
+                        - set: [pax, fresh_pax]
+                        - decl: [fresh_x, list<string>]
+                        - set: [xattrs, fresh_x]
+                        - set: [long_name, ""]
+                        - set: [long_link, ""]
+      - return: [""]
+
+# The layer tree of the uncompressed tar file `src` ("" + log line on error).
+- def:
+    name: layer_tree
+    args: [[repo, ref<ufo.repo.Repository>], [src, string]]
+    return: string
+    body:
+      - decl: [imp, ptr<ufo.tarlayer.TarImporter>, { new: ufo.tarlayer.TarImporter }]
+      - decl: [err, string, { call: [ufo.tarlayer.read_tar, src, imp] }]
+      - if: { condition: { gt: [err.len, 0] }, then: [{ call: [log.error, "ufo: ${src}: ${err}"] }, { return: [""] }] }
+      - return: [{ call: [imp.build, repo] }]
+
+# Collects a layer's entries; `build` writes blobs and trees.  Contents are
+# kept as references into the tar ("f<off>:<size>", "l<target>", "e") until then.
 - class:
     name: TarImporter
+    implements: [ufo.tarlayer.TarSink]
     members:
       - [attrs, list<string>, null, { access: public }]
       - [files, i64, 0, { access: public }]
       - [whiteouts, i64, 0, { access: public }]
       - [opaques, i64, 0, { access: public }]
       - [specials, i64, 0, { access: public }]
-      - [error, string, "", { access: public }]
-      - [entry_of, map<string:string>]     # file path → "<mode> <oid>"
+      - [src, string, ""]
+      - [entry_of, map<string:string>]     # file path → "<mode> <content ref>"
       - [file_order, list<string>]
       - [dir_seen, map<string:i32>]
       - [dir_order, list<string>]
@@ -155,6 +323,26 @@
           body:
             - if: { condition: { eq: [<.empty_id.len, 0] }, then: [{ set: [<.empty_id, { call: [repo.write_object, "blob", { call: [bytes.from_string, ""] }] }] }] }
             - return: [<.empty_id]
+
+      # The blob of a content reference.
+      - def:
+          name: blob_of
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [spec, string]]
+          return: string
+          body:
+            - decl: [kind, string, { call: [spec.substr, 0, 1] }]
+            - decl: [rest, string, { call: [spec.substr, 1] }]
+            - if: { condition: { eq: [kind, "l"] }, then: [{ return: [{ call: [repo.write_object, "blob", { call: [bytes.from_string, rest] }] }] }] }
+            - if:
+                condition: { eq: [kind, "f"] }
+                then:
+                  - decl: [cut, i32, { call: [rest.index_of, ":"] }]
+                  - decl: [off_txt, string, { call: [rest.substr, 0, cut] }]
+                  - decl: [len_txt, string, { call: [rest.substr, { +: [cut, 1] }] }]
+                  - decl: [body, buffer<u8>, { call: [bytes.file_slice, <.src, { call: [off_txt.to_int] }, { call: [len_txt.to_int] }] }]
+                  - return: [{ call: [repo.write_object, "blob", body] }]
+            - return: [{ call: [<.empty_blob, repo] }]
 
       # Registers `rel` and all its parents as directories.
       - def:
@@ -176,17 +364,21 @@
 
       - def:
           name: add_file
-          args: [[rel, string], [mode, string], [oid, string]]
+          args: [[rel, string], [mode, string], [spec, string]]
           body:
             - if: { condition: { eq: [{ call: [<.entry_of.contains, rel] }, 0] }, then: [{ call: [<.file_order.push, rel] }] }
-            - call: [<.entry_of.put, rel, "${mode} ${oid}"]
+            - call: [<.entry_of.put, rel, "${mode} ${spec}"]
             - call: [<.add_dir, { call: [ufo.tarlayer.parent_of, rel] }]
 
       - def:
           name: record
           static_off: ["str_cmp"]
-          args: [[kind, string], [perm, i64], [dflt, i64], [uid, i64], [gid, i64], [dev, string], [rel, string]]
+          args: [[kind, string], [dflt, i64], [dev, string], [ent, ref<ufo.tarlayer.TarEntry>]]
           body:
+            - decl: [perm, i64, { band: [ent.mode, 4095] }]
+            - decl: [uid, i64, ent.uid]
+            - decl: [gid, i64, ent.gid]
+            - decl: [rel, string, ent.rel]
             - decl: [special, i32, 0]
             - if: { condition: { or: [{ or: [{ eq: [kind, "c"] }, { eq: [kind, "b"] }] }, { or: [{ eq: [kind, "p"] }, { eq: [kind, "s"] }] }] }, then: [{ set: [special, 1] }] }
             - if: { condition: { eq: [kind, "l"] }, then: [{ set: [perm, 511] }, { set: [dflt, 511] }] }
@@ -195,127 +387,24 @@
                 then:
                   - call: [<.attrs.push, "${kind} ${{ call: [ufo.layer.octal, perm, 4] }} ${uid} ${gid} ${dev} ${rel}"]
 
-      # Reads one pax record block into the pending-overrides map / xattr list.
       - def:
-          name: read_pax
+          name: take
           static_off: ["str_cmp"]
-          args: [[data, buffer<u8>], [off, i64], [len, i64], [pax, map<string:string>], [xattrs, list<string>]]
+          args: [[src, string], [ent, ref<ufo.tarlayer.TarEntry>]]
+          return: i32
           body:
-            - decl: [pos, i64, off]
-            - decl: [stop, i64, { +: [off, len] }]
-            - while:
-                condition: { lt: [pos, stop] }
-                body:
-                  - decl: [space, i64, { call: [bytes.find, data, 32, pos] }]
-                  - if:
-                      condition: { or: [{ lt: [space, 0] }, { ge: [space, stop] }] }
-                      then: [{ set: [pos, stop] }]
-                      else:
-                        - decl: [len_txt, string, { call: [bytes.text, data, pos, { -: [space, pos] }] }]
-                        - decl: [rec_len, i64, { call: [len_txt.to_int] }]
-                        - if:
-                            condition: { or: [{ le: [rec_len, 0] }, { gt: [{ +: [pos, rec_len] }, stop] }] }
-                            then: [{ set: [pos, stop] }]
-                            else:
-                              - decl: [key_at, i64, { +: [space, 1] }]
-                              - decl: [eq_at, i64, { call: [bytes.find, data, 61, key_at] }]
-                              - decl: [rec_end, i64, { -: [{ +: [pos, rec_len] }, 1] }]
-                              - if:
-                                  condition: { and: [{ gt: [eq_at, 0] }, { lt: [eq_at, rec_end] }] }
-                                  then:
-                                    - decl: [key, string, { call: [bytes.text, data, key_at, { -: [eq_at, key_at] }] }]
-                                    - decl: [val_at, i64, { +: [eq_at, 1] }]
-                                    - if:
-                                        condition: { eq: [{ call: [key.starts_with, "SCHILY.xattr."] }, 1] }
-                                        then:
-                                          - decl: [value, buffer<u8>, { call: [bytes.slice, data, val_at, { -: [rec_end, val_at] }] }]
-                                          - call: [xattrs.push, "${{ call: [key.substr, 13] }} ${{ call: [bytes.to_hex, value] }}"]
-                                        else:
-                                          - call: [pax.put, key, { call: [bytes.text, data, val_at, { -: [rec_end, val_at] }] }]
-                              - set: [pos, { +: [pos, rec_len] }]
-
-      # The layer tree for one uncompressed tar.  "" + error on a broken tar.
-      - def:
-          name: run
-          static_off: ["str_cmp"]
-          args: [[repo, ref<ufo.repo.Repository>], [data, buffer<u8>]]
-          return: string
-          body:
-            - call: [<.add_dir, ""]
-            - decl: [pos, i64, 0]
-            - decl: [pax, map<string:string>]
-            - decl: [xattrs, list<string>]
-            - decl: [long_name, string, ""]
-            - decl: [long_link, string, ""]
-            - decl: [going, i32, 1]
-            - while:
-                condition: { and: [{ eq: [going, 1] }, { le: [{ +: [pos, 512] }, data.len] }] }
-                body:
-                  - decl: [name, string, { call: [bytes.text, data, pos, 100] }]
-                  - if:
-                      condition: { eq: [name.len, 0] }
-                      then: [{ set: [going, 0] }]
-                      else:
-                        - decl: [flag, i32, { call: [bytes.u8, data, { +: [pos, 156] }] }]
-                        - decl: [size, i64, { call: [ufo.tarlayer.number, data, { +: [pos, 124] }, 12] }]
-                        - decl: [mode, i64, { call: [ufo.tarlayer.number, data, { +: [pos, 100] }, 8] }]
-                        - decl: [uid, i64, { call: [ufo.tarlayer.number, data, { +: [pos, 108] }, 8] }]
-                        - decl: [gid, i64, { call: [ufo.tarlayer.number, data, { +: [pos, 116] }, 8] }]
-                        - decl: [link, string, { call: [bytes.text, data, { +: [pos, 157] }, 100] }]
-                        - decl: [magic, string, { call: [bytes.text, data, { +: [pos, 257] }, 5] }]
-                        - if:
-                            condition: { eq: [magic, "ustar"] }
-                            then:
-                              - decl: [prefix, string, { call: [bytes.text, data, { +: [pos, 345] }, 155] }]
-                              - if: { condition: { gt: [prefix.len, 0] }, then: [{ set: [name, "${prefix}/${name}"] }] }
-                        - decl: [dmaj, i64, { call: [ufo.tarlayer.number, data, { +: [pos, 329] }, 8] }]
-                        - decl: [dmin, i64, { call: [ufo.tarlayer.number, data, { +: [pos, 337] }, 8] }]
-                        - decl: [body_at, i64, { +: [pos, 512] }]
-                        - if: { condition: { eq: [{ call: [pax.contains, "size"] }, 1] }, then: [{ decl: [pax_size, string, { call: [pax.get, "size"] }] }, { set: [size, { call: [pax_size.to_int] }] }] }
-                        - if:
-                            condition: { gt: [{ +: [body_at, size] }, data.len] }
-                            then:
-                              - set: [<.error, "truncated tar at ${pos}"]
-                              - return: [""]
-                        - decl: [blocks, i64, { '/': [{ +: [size, 511] }, 512] }]
-                        - set: [pos, { +: [body_at, { '*': [blocks, 512] }] }]
-                        # meta entries change the NEXT entry
-                        - decl: [meta, i32, 0]
-                        - if: { condition: { eq: [flag, 120] }, then: [{ call: [<.read_pax, data, body_at, size, pax, xattrs] }, { set: [meta, 1] }] }
-                        - if: { condition: { eq: [flag, 103] }, then: [{ set: [meta, 1] }] }
-                        - if: { condition: { eq: [flag, 76] }, then: [{ set: [long_name, { call: [bytes.text, data, body_at, size] }] }, { set: [meta, 1] }] }
-                        - if: { condition: { eq: [flag, 75] }, then: [{ set: [long_link, { call: [bytes.text, data, body_at, size] }] }, { set: [meta, 1] }] }
-                        - if:
-                            condition: { eq: [meta, 0] }
-                            then:
-                              - if: { condition: { gt: [long_name.len, 0] }, then: [{ set: [name, long_name] }] }
-                              - if: { condition: { gt: [long_link.len, 0] }, then: [{ set: [link, long_link] }] }
-                              - if: { condition: { eq: [{ call: [pax.contains, "path"] }, 1] }, then: [{ set: [name, { call: [pax.get, "path"] }] }] }
-                              - if: { condition: { eq: [{ call: [pax.contains, "linkpath"] }, 1] }, then: [{ set: [link, { call: [pax.get, "linkpath"] }] }] }
-                              - if: { condition: { eq: [{ call: [pax.contains, "uid"] }, 1] }, then: [{ decl: [pax_uid, string, { call: [pax.get, "uid"] }] }, { set: [uid, { call: [pax_uid.to_int] }] }] }
-                              - if: { condition: { eq: [{ call: [pax.contains, "gid"] }, 1] }, then: [{ decl: [pax_gid, string, { call: [pax.get, "gid"] }] }, { set: [gid, { call: [pax_gid.to_int] }] }] }
-                              - call: [<.entry, repo, data, body_at, size, flag, { call: [ufo.tarlayer.clean, name] }, link, mode, uid, gid, dmaj, dmin, xattrs]
-                              - decl: [fresh_pax, map<string:string>]
-                              - set: [pax, fresh_pax]
-                              - decl: [fresh_x, list<string>]
-                              - set: [xattrs, fresh_x]
-                              - set: [long_name, ""]
-                              - set: [long_link, ""]
-            - if: { condition: { gt: [<.error.len, 0] }, then: [{ return: [""] }] }
-            - return: [{ call: [<.build, repo] }]
-
-      - def:
-          name: entry
-          static_off: ["str_cmp"]
-          args: [[repo, ref<ufo.repo.Repository>], [data, buffer<u8>], [body_at, i64], [size, i64], [flag, i32], [rel, string], [link, string], [mode, i64], [uid, i64], [gid, i64], [dmaj, i64], [dmin, i64], [xattrs, list<string>]]
-          body:
-            - if: { condition: { eq: [rel.len, 0] }, then: [{ return: [] }] }
+            - set: [<.src, src]
+            - decl: [rel, string, ent.rel]
+            - if: { condition: { eq: [rel.len, 0] }, then: [{ return: [0] }] }
             - if:
                 condition: { eq: [rel, ".ufo-attributes"] }
                 then:
                   - call: [log.warn, "ufo: .ufo-attributes in the layer tar is reserved — skipped"]
-                  - return: []
-            - decl: [perm, i64, { band: [mode, 4095] }]
+                  - return: [0]
+            - decl: [flag, i32, ent.flag]
+            - decl: [uid, i64, ent.uid]
+            - decl: [gid, i64, ent.gid]
+            - decl: [perm, i64, { band: [ent.mode, 4095] }]
             - decl: [base, string, { call: [ufo.tarlayer.base_of, rel] }]
             - if: { condition: { eq: [base, ".wh..wh..opq"] }, then: [{ set: [<.opaques, { +: [<.opaques, 1] }] }], else: [{ if: { condition: { eq: [{ call: [base.starts_with, ".wh."] }, 1] }, then: [{ set: [<.whiteouts, { +: [<.whiteouts, 1] }] }] } }] }
             # 5 directory
@@ -323,7 +412,7 @@
                 condition: { eq: [flag, 53] }
                 then:
                   - call: [<.add_dir, rel]
-                  - call: [<.record, "d", perm, 493, uid, gid, "-", rel]
+                  - call: [<.record, "d", 493, "-", ent]
                 else:
                   - decl: [kind, string, ""]
                   - if: { condition: { eq: [flag, 51] }, then: [{ set: [kind, "c"] }] }
@@ -332,14 +421,14 @@
                   - if:
                       condition: { eq: [flag, 50] }
                       then:
-                        - call: [<.add_file, rel, "120000", { call: [repo.write_object, "blob", { call: [bytes.from_string, link] }] }]
-                        - call: [<.record, "l", perm, 511, uid, gid, "-", rel]
+                        - call: [<.add_file, rel, "120000", "l${ent.link}"]
+                        - call: [<.record, "l", 511, "-", ent]
                         - set: [<.files, { +: [<.files, 1] }]
                   - if:
                       condition: { eq: [flag, 49] }
                       then:
                         # hard link: the target's content and mode
-                        - decl: [target, string, { call: [ufo.tarlayer.clean, link] }]
+                        - decl: [target, string, { call: [ufo.tarlayer.clean, ent.link] }]
                         - if:
                             condition: { eq: [{ call: [<.entry_of.contains, target] }, 1] }
                             then:
@@ -348,17 +437,17 @@
                               - call: [<.add_file, rel, { call: [prior.substr, 0, cut] }, { call: [prior.substr, { +: [cut, 1] }] }]
                               - decl: [hdflt, i64, 420]
                               - if: { condition: { neq: [{ band: [perm, 64] }, 0] }, then: [{ set: [hdflt, 493] }] }
-                              - call: [<.record, "f", perm, hdflt, uid, gid, "-", rel]
+                              - call: [<.record, "f", hdflt, "-", ent]
                               - set: [<.files, { +: [<.files, 1] }]
                             else:
                               - call: [log.warn, "ufo: hard link ${rel} → ${target}: target not in this layer — skipped"]
                   - if:
                       condition: { gt: [kind.len, 0] }
                       then:
-                        - call: [<.add_file, rel, "100644", { call: [<.empty_blob, repo] }]
+                        - call: [<.add_file, rel, "100644", "e"]
                         - decl: [dev, string, "-"]
-                        - if: { condition: { or: [{ eq: [kind, "c"] }, { eq: [kind, "b"] }] }, then: [{ set: [dev, "${dmaj}:${dmin}"] }] }
-                        - call: [<.record, kind, perm, 420, uid, gid, dev, rel]
+                        - if: { condition: { or: [{ eq: [kind, "c"] }, { eq: [kind, "b"] }] }, then: [{ set: [dev, "${ent.dmaj}:${ent.dmin}"] }] }
+                        - call: [<.record, kind, 420, dev, ent]
                         - set: [<.specials, { +: [<.specials, 1] }]
                   # 0 / NUL / 7: regular file
                   - if:
@@ -367,18 +456,19 @@
                         - decl: [gmode, string, "100644"]
                         - decl: [dflt, i64, 420]
                         - if: { condition: { neq: [{ band: [perm, 64] }, 0] }, then: [{ set: [gmode, "100755"] }, { set: [dflt, 493] }] }
-                        - call: [<.add_file, rel, gmode, { call: [repo.write_object, "blob", { call: [bytes.slice, data, body_at, size] }] }]
-                        - call: [<.record, "f", perm, dflt, uid, gid, "-", rel]
+                        - call: [<.add_file, rel, gmode, "f${ent.body_at}:${ent.size}"]
+                        - call: [<.record, "f", dflt, "-", ent]
                         - set: [<.files, { +: [<.files, 1] }]
             - decl: [xdx, i32, 0]
             - while:
-                condition: { lt: [xdx, xattrs.len] }
+                condition: { lt: [xdx, ent.xattrs.len] }
                 body:
-                  - decl: [pair, string, { call: [xattrs.get, xdx] }]
+                  - decl: [pair, string, { call: [ent.xattrs.get, xdx] }]
                   - set: [xdx, { +: [xdx, 1] }]
                   - if:
                       condition: { and: [{ eq: [{ call: [pair.starts_with, "trusted.overlay."] }, 0] }, { eq: [{ call: [pair.starts_with, "user.overlay."] }, 0] }] }
                       then: [{ call: [<.attrs.push, "x ${pair} ${rel}"] }]
+            - return: [0]
 
       # Trees bottom-up: every directory, deepest first; the root last.
       - def:
@@ -387,6 +477,7 @@
           args: [[repo, ref<ufo.repo.Repository>]]
           return: string
           body:
+            - call: [<.add_dir, ""]
             - decl: [kids, map<string:string>]
             - decl: [fdx, i32, 0]
             - while:
@@ -401,7 +492,12 @@
                         - decl: [par, string, { call: [ufo.tarlayer.parent_of, rel] }]
                         - decl: [sofar, string, ""]
                         - if: { condition: { eq: [{ call: [kids.contains, par] }, 1] }, then: [{ set: [sofar, { call: [kids.get, par] }] }] }
-                        - call: [kids.put, par, "${sofar}${{ call: [ufo.tarlayer.base_of, rel] }} ${{ call: [<.entry_of.get, rel] }}\n"]
+                        - decl: [held, string, { call: [<.entry_of.get, rel] }]
+                        - decl: [cut, i32, { call: [held.index_of, " "] }]
+                        - decl: [gmode, string, { call: [held.substr, 0, cut] }]
+                        - decl: [oid, string, { call: [<.blob_of, repo, { call: [held.substr, { +: [cut, 1] }] }] }]
+                        - decl: [leaf, string, { call: [ufo.tarlayer.base_of, rel] }]
+                        - call: [kids.put, par, "${sofar}${leaf} ${gmode} ${oid}\n"]
             - decl: [keys, list<string>]
             - decl: [ddx, i32, 0]
             - while:

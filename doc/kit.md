@@ -1,6 +1,22 @@
 # ufo.kit — the layer kit (a group interface, aiml spec/58 §12)
 
-Status: **specified 2026-10-28; tests in place (RED until implemented).**
+Status: **implemented 2026-10-28** — tests/kit.sh 39/39 (incl. part B against
+cosmos-oci), tests/kit_museum.sh 9/9 against a live museum,
+tests/test_kit_contract.aiml PASS, memcheck clean (0 errors).
+
+Implementation notes:
+- One tar reader for everything (`ufo.tarlayer.read_tar` → `TarSink`): the
+  applier (import) and the importer (history) are two sinks.  It reads headers
+  only; contents stay in the file.
+- Import walks each layer twice: markers first (opaque clears, `.wh.` removes),
+  then the entries — independent of where a marker sits in the tar.  Paths with
+  `..` and writes through a symlinked parent are refused.
+- Known limit: the aiml HTTP client buffers a response body in memory before
+  `save_to` writes it, so `pull` of a multi-GB layer needs that much RAM
+  (aiml runtime, to be streamed).
+- Part B uses a fixture without real device nodes and foreign owners: cosmos'
+  converter runs tar/cp in a user namespace that cannot create them.  Once
+  cosmos imports through this kit that restriction disappears.
 
 cosmos produces one filesystem layer per pipeline stage, exports them as an OCI
 image, pushes that to museum, pulls images back and lays them out as a rootfs.

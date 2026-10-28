@@ -1,0 +1,242 @@
+# ufo.kit.HttpRegistry — an OCI distribution registry over HTTP (museum's
+# /v2/, doc/kit.md §3).  Blobs go up monolithically (POST + PUT ?digest=)
+# streamed from the file and come down into a temp file that is verified
+# before it enters the layout.  The token travels only in the Authorization
+# header; no log line contains it.
+- namespace: ufo.kit
+
+- import: "contracts.aiml"
+- import: "layoutfs.aiml"
+- import: "reference.aiml"
+- import: "model_config.aiml"
+
+- class:
+    name: HttpRegistry
+    implements: [ufo.kit.Registry]
+    members:
+      - [base, string, ""]
+      - [token, string, ""]
+      - [work, string, ".ufo-kit"]
+      # the last exchange
+      - [status, i32, 0]
+      - [error, string, ""]
+      - [location, string, ""]
+      - [content_type, string, ""]
+      - [reported, string, ""]     # Docker-Content-Digest
+    methods:
+      - def:
+          name: setup
+          args: [[url, string], [token, string], [work_dir, string]]
+          body:
+            - decl: [trimmed, string, url]
+            - while:
+                condition: { eq: [{ call: [trimmed.ends_with, "/"] }, 1] }
+                body:
+                  - set: [trimmed, { call: [trimmed.substr, 0, { -: [trimmed.len, 1] }] }]
+            - set: [<.base, trimmed]
+            - set: [<.token, token]
+            - if: { condition: { gt: [work_dir.len, 0] }, then: [{ set: [<.work, work_dir] }] }
+
+      - def:
+          name: files
+          return: ptr<ufo.kit.Layout>
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { new: ufo.kit.Layout }]
+            - set: [lay.work, <.work]
+            - return: [lay]
+
+      - def:
+          name: fail
+          args: [[message, string]]
+          return: string
+          body:
+            - call: [log.error, "ufo: ${message}"]
+            - return: [""]
+
+      # One exchange.  `target` is a path below the registry ("/v2/…") or an
+      # absolute URL (an upload Location).  `body_file` ("" = none) is sent as
+      # the body, the answer saved to `save_as` ("" = dropped).  The status.
+      - def:
+          name: exchange
+          static_off: ["str_cmp"]
+          args: [[method, string], [target, string], [headers, list<string>], [body_file, string], [save_as, string]]
+          return: i32
+          body:
+            - set: [<.status, 0]
+            - set: [<.error, ""]
+            - set: [<.location, ""]
+            - set: [<.content_type, ""]
+            - set: [<.reported, ""]
+            - decl: [full, string, target]
+            - if: { condition: { eq: [{ call: [target.starts_with, "/"] }, 1] }, then: [{ set: [full, "${<.base}${target}"] }] }
+            - decl: [dest, url, { call: [http.parse_url, full] }]
+            - decl: [client, http_client_handle, { call: [http.new_request, method, dest] }]
+            - call: [client.headers.put, "User-Agent", "ufo/0.1"]
+            - if: { condition: { gt: [<.token.len, 0] }, then: [{ call: [client.headers.put, "Authorization", "Bearer ${<.token}"] }] }
+            # "Name: value" lines
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, headers.len] }
+                body:
+                  - decl: [line, string, { call: [headers.get, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [cut, i32, { call: [line.index_of, ": "] }]
+                  - if: { condition: { gt: [cut, 0] }, then: [{ call: [client.headers.put, { call: [line.substr, 0, cut] }, { call: [line.substr, { +: [cut, 2] }] }] }] }
+            - set: [client.timeout, 600000]
+            - if: { condition: { gt: [body_file.len, 0] }, then: [{ set: [client.body_file, body_file] }] }
+            - decl: [answer, http_response_handle, { call: [client.send] }]
+            - call: [client.free]
+            - if:
+                condition: { eq: [answer, null] }
+                then:
+                  - set: [<.error, "${method} ${<.base}: no answer"]
+                  - return: [0]
+            - set: [<.status, { call: [answer.status] }]
+            - decl: [got, map<string:string>, answer.headers]
+            - if: { condition: { eq: [{ call: [got.contains, "location"] }, 1] }, then: [{ set: [<.location, { call: [got.get, "location"] }] }] }
+            - if: { condition: { eq: [{ call: [got.contains, "content-type"] }, 1] }, then: [{ set: [<.content_type, { call: [got.get, "content-type"] }] }] }
+            - if: { condition: { eq: [{ call: [got.contains, "docker-content-digest"] }, 1] }, then: [{ set: [<.reported, { call: [got.get, "docker-content-digest"] }] }] }
+            - decl: [saved, i32, 0]
+            - if: { condition: { and: [{ gt: [save_as.len, 0] }, { and: [{ ge: [<.status, 200] }, { lt: [<.status, 300] }] }] }, then: [{ set: [saved, { call: [answer.save_to, save_as] }] }] }
+            - call: [answer.free]
+            - if: { condition: { neq: [saved, 0] }, then: [{ set: [<.error, "cannot store the answer to ${method} ${target}"] }, { return: [0] }] }
+            - if: { condition: { or: [{ lt: [<.status, 200] }, { ge: [<.status, 300] }] }, then: [{ set: [<.error, "${method} ${target}: HTTP ${<.status}"] }] }
+            - return: [<.status]
+
+      - def:
+          name: ok
+          return: i32
+          body:
+            - if: { condition: { and: [{ ge: [<.status, 200] }, { lt: [<.status, 300] }] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      # Uploads blob `hex` of `layout` unless the registry has it.  0 / 1.
+      - def:
+          name: put_blob
+          args: [[layout, string], [repo, string], [hex, string]]
+          return: i32
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - if: { condition: { eq: [{ call: [lay.verified, layout, hex] }, 0] }, then: [{ set: [<.error, lay.error] }, { return: [1] }] }
+            - decl: [none, list<string>]
+            - call: [<.exchange, "HEAD", "/v2/${repo}/blobs/sha256:${hex}", none, "", ""]
+            - if: { condition: { eq: [<.status, 200] }, then: [{ return: [0] }] }
+            - if: { condition: { eq: [<.status, 0] }, then: [{ return: [1] }] }
+            - call: [<.exchange, "POST", "/v2/${repo}/blobs/uploads/", none, "", ""]
+            - if: { condition: { eq: [{ call: [<.ok] }, 0] }, then: [{ return: [1] }] }
+            - if: { condition: { eq: [<.location.len, 0] }, then: [{ set: [<.error, "POST /v2/${repo}/blobs/uploads/: no Location"] }, { return: [1] }] }
+            - decl: [upload, string, <.location]
+            - decl: [joiner, string, "?"]
+            - if: { condition: { ge: [{ call: [upload.index_of, "?"] }, 0] }, then: [{ set: [joiner, "&"] }] }
+            - decl: [heads, list<string>]
+            - call: [heads.push, "Content-Type: application/octet-stream"]
+            - call: [<.exchange, "PUT", "${upload}${joiner}digest=sha256:${hex}", heads, { call: [lay.blob_path, layout, hex] }, ""]
+            - if: { condition: { eq: [{ call: [<.ok] }, 0] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      - def:
+          name: push
+          args: [[layout, string], [reference, string], [artifact_type, string]]
+          return: string
+          body:
+            - decl: [ref, ptr<ufo.kit.Reference>, { new: ufo.kit.Reference }]
+            - if: { condition: { neq: [{ call: [ref.parse, reference] }, 0] }, then: [{ return: [{ call: [<.fail, ref.error] }] }] }
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [man_hex, string, { call: [lay.manifest_for, layout, ""] }]
+            - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - if:
+                condition: { gt: [artifact_type.len, 0] }
+                then:
+                  - set: [man_hex, { call: [lay.with_artifact_type, layout, man_hex, artifact_type] }]
+                  - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [man, ufo.kit.KitManifest, { call: [lay.manifest, layout, man_hex] }]
+            - if: { condition: { eq: [man.mediaType.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [hexes, list<string>, { call: [lay.blobs_of, layout, man_hex] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, hexes.len] }
+                body:
+                  - if: { condition: { neq: [{ call: [<.put_blob, layout, ref.repo, { call: [hexes.get, idx] }] }, 0] }, then: [{ return: [{ call: [<.fail, <.error] }] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - decl: [heads, list<string>]
+            - call: [heads.push, "Content-Type: ${man.mediaType}"]
+            - decl: [target, string, { call: [ref.target] }]
+            - if: { condition: { gt: [ref.digest.len, 0] }, then: [{ set: [target, "sha256:${man_hex}"] }] }
+            - call: [<.exchange, "PUT", "/v2/${ref.repo}/manifests/${target}", heads, { call: [lay.blob_path, layout, man_hex] }, ""]
+            - if: { condition: { eq: [{ call: [<.ok] }, 0] }, then: [{ return: [{ call: [<.fail, <.error] }] }] }
+            - if: { condition: { and: [{ gt: [<.reported.len, 0] }, { neq: [<.reported, "sha256:${man_hex}"] }] }, then: [{ return: [{ call: [<.fail, "${reference}: the registry stored ${<.reported}, expected sha256:${man_hex}"] }] }] }
+            - return: ["sha256:${man_hex}"]
+
+      # GETs blob `hex` into `layout`, verified.  0 / 1.
+      - def:
+          name: get_blob
+          args: [[repo, string], [hex, string], [layout, string]]
+          return: i32
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - if: { condition: { call: [io.is_file, { call: [lay.blob_path, layout, hex] }] }, then: [{ if: { condition: { eq: [{ call: [lay.verified, layout, hex] }, 1] }, then: [{ return: [0] }] } }] }
+            - decl: [tmp, string, { call: [lay.tmp_file, "pull"] }]
+            - decl: [none, list<string>]
+            - call: [<.exchange, "GET", "/v2/${repo}/blobs/sha256:${hex}", none, "", tmp]
+            - if: { condition: { eq: [{ call: [<.ok] }, 0] }, then: [{ return: [1] }] }
+            - decl: [got, string, { call: [lay.adopt, layout, tmp, hex] }]
+            - if: { condition: { eq: [got.len, 0] }, then: [{ set: [<.error, lay.error] }, { return: [1] }] }
+            - return: [0]
+
+      # GETs a manifest (or index) by tag/digest into a temp file; its path or "".
+      - def:
+          name: get_manifest
+          args: [[repo, string], [target, string]]
+          return: string
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [tmp, string, { call: [lay.tmp_file, "manifest"] }]
+            - decl: [heads, list<string>]
+            - call: [heads.push, "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"]
+            - call: [<.exchange, "GET", "/v2/${repo}/manifests/${target}", heads, "", tmp]
+            - if: { condition: { eq: [{ call: [<.ok] }, 0] }, then: [{ return: [""] }] }
+            - return: [tmp]
+
+      - def:
+          name: pull
+          static_off: ["str_cmp"]
+          args: [[reference, string], [layout, string]]
+          return: string
+          body:
+            - decl: [ref, ptr<ufo.kit.Reference>, { new: ufo.kit.Reference }]
+            - if: { condition: { neq: [{ call: [ref.parse, reference] }, 0] }, then: [{ return: [{ call: [<.fail, ref.error] }] }] }
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [tmp, string, { call: [<.get_manifest, ref.repo, { call: [ref.target] }] }]
+            - if: { condition: { eq: [tmp.len, 0] }, then: [{ return: [{ call: [<.fail, <.error] }] }] }
+            - decl: [arch, string, ""]
+            # an index: the first manifest, its platform recorded (not guessed)
+            - if:
+                condition: { or: [{ eq: [{ call: [<.content_type.starts_with, "application/vnd.oci.image.index"] }, 1] }, { eq: [{ call: [<.content_type.starts_with, "application/vnd.docker.distribution.manifest.list"] }, 1] }] }
+                then:
+                  - decl: [index, ufo.kit.KitIndex, { call: [sys.deserialize, { call: [io.read_file, tmp] }, "ufo.kit.KitIndex"] }]
+                  - call: [io.remove, tmp]
+                  - if: { condition: { eq: [index.manifests.len, 0] }, then: [{ return: [{ call: [<.fail, "${reference}: an empty index"] }] }] }
+                  - decl: [first, ufo.kit.KitRef, { at: [index.manifests, 0] }]
+                  - set: [arch, first.platform.architecture]
+                  - set: [tmp, { call: [<.get_manifest, ref.repo, first.digest] }]
+                  - if: { condition: { eq: [tmp.len, 0] }, then: [{ return: [{ call: [<.fail, <.error] }] }] }
+            - decl: [expect, string, ""]
+            - if: { condition: { gt: [ref.digest.len, 0] }, then: [{ set: [expect, { call: [ref.digest.substr, 7] }] }] }
+            - decl: [man_hex, string, { call: [lay.adopt, layout, tmp, expect] }]
+            - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [hexes, list<string>, { call: [lay.blobs_of, layout, man_hex] }]
+            - if: { condition: { eq: [hexes.len, 0] }, then: [{ return: [{ call: [<.fail, "${reference}: the manifest names no blobs"] }] }] }
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, hexes.len] }
+                body:
+                  - if: { condition: { neq: [{ call: [<.get_blob, ref.repo, { call: [hexes.get, idx] }, layout] }, 0] }, then: [{ return: [{ call: [<.fail, <.error] }] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - if:
+                condition: { eq: [arch.len, 0] }
+                then:
+                  # the config says which platform the image is for
+                  - decl: [cfg, ufo.kit.KitImgCfg, { call: [sys.deserialize, { call: [io.read_file, { call: [lay.blob_path, layout, { call: [hexes.get, 0] }] }] }, "ufo.kit.KitImgCfg"] }]
+                  - set: [arch, cfg.architecture]
+            - call: [lay.write_index, layout, man_hex, { call: [io.file_size, { call: [lay.blob_path, layout, man_hex] }] }, ref.tag, arch]
+            - return: ["sha256:${man_hex}"]

@@ -1,0 +1,20 @@
+# ufo.kit contracts (doc/kit.md §1): the three interfaces the LayerKit exports.
+- namespace: ufo.kit
+
+- interface:
+    name: Images
+    methods:
+      - [export_layers, i32, [[layers, string], [layout, string], [ref_name, string], [arch, string]]]
+      - [export_dir, i32, [[dir, string], [layout, string], [ref_name, string], [arch, string]]]
+      - [import_image, i32, [[layout, string], [rootfs, string], [arch, string]]]
+
+- interface:
+    name: Registry
+    methods:
+      - [push, string, [[layout, string], [reference, string], [artifact_type, string]]]
+      - [pull, string, [[reference, string], [layout, string]]]
+
+- interface:
+    name: History
+    methods:
+      - [record, i32, [[layout, string], [pipeline, string]]]

@@ -1,0 +1,26 @@
+# OCI index / manifest / config rootfs, as READ by ufo.kit.
+- namespace: ufo.kit
+
+- import: "model_desc.aiml"
+
+- model:
+    name: KitIndex
+    fields:
+      - [schemaVersion, i32, 0]
+      - [mediaType, string, ""]
+      - [manifests, list<ufo.kit.KitRef>]
+
+- model:
+    name: KitManifest
+    fields:
+      - [schemaVersion, i32, 0]
+      - [mediaType, string, ""]
+      - [artifactType, string, ""]
+      - [config, ufo.kit.KitDesc]
+      - [layers, list<ufo.kit.KitDesc>]
+
+- model:
+    name: KitRootfs
+    fields:
+      - [type, string, ""]
+      - [diff_ids, list<string>]

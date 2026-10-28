@@ -1,0 +1,18 @@
+# ufo.kit.LayoutKit — the layer kit with a directory as registry
+# (<root>/<repository>/<tag>/, doc/kit.md §1): offline, tests, `oci:` targets.
+- namespace: ufo.kit
+
+- import: "api.aiml"
+- import: "images.aiml"
+- import: "registry_dir.aiml"
+- import: "history.aiml"
+
+- classgroup:
+    name: LayoutKit
+    implements: [ufo.kit.LayerKit]
+    params: [[root, string], [git_dir, string], [work_dir, string]]
+    instances:
+      - { class: ufo.kit.OciImages, instance: images, constructor: [setup, work_dir] }
+      - { class: ufo.kit.DirRegistry, instance: registry, constructor: [setup, root, work_dir] }
+      - { class: ufo.kit.LayerHistory, instance: history, constructor: [setup, git_dir, work_dir] }
+    export: [images, registry, history]

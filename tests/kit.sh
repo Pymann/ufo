@@ -1,7 +1,8 @@
 #!/bin/bash
 # ufo.kit (doc/kit.md §6): layers ⇄ OCI image, through the LayoutKit — no network.
 #   UFO=./ufo tests/kit.sh            (root: overlayfs, device nodes, owners, trusted.* xattrs)
-#   COSMOS_RT_OCI=/path/to/cosmos-rt-oci COSMOS_BASE=/path/to/rt_base  → part B as well
+#   COSMOS_RT_OCI=/path/to/cosmos-oci COSMOS_BASE=/path/to/rt_base  → part B as well
+#   (COSMOS_RT: the cosmos-rt helper it runs, default: next to COSMOS_RT_OCI)
 set -u
 cd "$(dirname "$0")/.."
 UFO="${UFO:-./ufo}"
@@ -112,11 +113,21 @@ check "import, corrupted blob" "$($UFO image import "$WORK/bad" "$WORK/rb" 2>&1 
 
 if [ -n "${COSMOS_RT_OCI:-}" ] && [ -x "$COSMOS_RT_OCI" ]; then
   echo "B. cosmos compatibility"
-  "$COSMOS_RT_OCI" --image "$WORK/img1" --bundle "$WORK/cb" --base "$COSMOS_BASE" > /dev/null 2>&1
-  check "cosmos imports what ufo exported" "$(listing "$WORK/cb/rootfs")" "$EXPECT"
-  "$COSMOS_RT_OCI" --layers "$L" --image "$WORK/cimg" --ref-name build --base "$COSMOS_BASE" > /dev/null 2>&1
+  # cosmos' converter runs tar/cp in a user namespace: no real device nodes, no
+  # owners outside its mapping (whiteouts 0:0 are fine).  So part B uses the
+  # same layers without those two shapes and compares against ufo's own import.
+  CRT="${COSMOS_RT:-$(dirname "$COSMOS_RT_OCI")/cosmos-rt}"
+  LB="$WORK/layers_b"; cp -a "$L" "$LB"; rm -f "$LB/0/upper/etc/null"
+  chown -hR 0:0 "$LB"; chmod 4755 "$LB/0/upper/usr/bin/hi"; chmod 700 "$LB/0/upper/home/user"
+  $UFO image export-layers "$LB" "$WORK/imgb" --ref build > /dev/null 2>&1
+  $UFO image import "$WORK/imgb" "$WORK/rootb" > /dev/null 2>&1
+  REF_B="$(listing "$WORK/rootb")"
+  "$COSMOS_RT_OCI" --image "$WORK/imgb" --bundle "$WORK/cb" --base "$COSMOS_BASE" --rtbin "$CRT" --work "$WORK/cwork" > "$WORK/cos1.log" 2>&1 || grep -iE "tar:|ERROR" "$WORK/cos1.log" | head -5
+  # the bundle's /dev holds cosmos' own mount targets — not part of the image
+  check "cosmos imports what ufo exported" "$(listing "$WORK/cb/rootfs" | grep -vE '\./dev( |/|$)')" "$REF_B"
+  "$COSMOS_RT_OCI" --layers "$LB" --image "$WORK/cimg" --ref-name build --base "$COSMOS_BASE" --rtbin "$CRT" --work "$WORK/cwork" > "$WORK/cos2.log" 2>&1 || grep -iE "tar:|ERROR" "$WORK/cos2.log" | head -5
   $UFO image import "$WORK/cimg" "$WORK/cr" > /dev/null 2>&1
-  check "ufo imports what cosmos exported" "$(listing "$WORK/cr")" "$EXPECT"
+  check "ufo imports what cosmos exported" "$(listing "$WORK/cr")" "$REF_B"
 else
   echo "B. cosmos compatibility: skipped (COSMOS_RT_OCI not set)"
 fi

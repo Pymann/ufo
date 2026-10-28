@@ -1,0 +1,121 @@
+# ufo.kit.DirRegistry — a registry that is a directory of layouts
+# (<root>/<repository>/<tag>/, doc/kit.md §3): offline, tests, `oci:` targets.
+- namespace: ufo.kit
+
+- import: "contracts.aiml"
+- import: "layoutfs.aiml"
+- import: "reference.aiml"
+
+- class:
+    name: DirRegistry
+    implements: [ufo.kit.Registry]
+    members:
+      - [root, string, ""]
+      - [work, string, ".ufo-kit"]
+    methods:
+      - def:
+          name: setup
+          args: [[root, string], [work_dir, string]]
+          body:
+            - set: [<.root, root]
+            - if: { condition: { gt: [work_dir.len, 0] }, then: [{ set: [<.work, work_dir] }] }
+
+      - def:
+          name: files
+          return: ptr<ufo.kit.Layout>
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { new: ufo.kit.Layout }]
+            - set: [lay.work, <.work]
+            - return: [lay]
+
+      - def:
+          name: fail
+          args: [[message, string]]
+          return: string
+          body:
+            - call: [log.error, "ufo: ${message}"]
+            - return: [""]
+
+      # Copies the image (manifest `man_hex` + its blobs) from `src` to `dst`
+      # and writes dst's index.json.  "" on success, else the error.
+      - def:
+          name: transfer
+          args: [[src, string], [man_hex, string], [dst, string], [ref_name, string]]
+          return: string
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [arch, string, ""]
+            - decl: [found, string, { call: [lay.manifest_for, src, ""] }]
+            - if: { condition: { gt: [found.len, 0] }, then: [{ set: [arch, lay.arch] }] }
+            - if: { condition: { neq: [{ call: [lay.copy_blob, src, man_hex, dst] }, 0] }, then: [{ return: [lay.error] }] }
+            - decl: [hexes, list<string>, { call: [lay.blobs_of, dst, man_hex] }]
+            - if: { condition: { eq: [hexes.len, 0] }, then: [{ return: ["${src}: manifest sha256:${man_hex} names no blobs"] }] }
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, hexes.len] }
+                body:
+                  - if: { condition: { neq: [{ call: [lay.copy_blob, src, { call: [hexes.get, idx] }, dst] }, 0] }, then: [{ return: [lay.error] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - call: [lay.write_index, dst, man_hex, { call: [io.file_size, { call: [lay.blob_path, dst, man_hex] }] }, ref_name, arch]
+            - return: [""]
+
+      - def:
+          name: push
+          args: [[layout, string], [reference, string], [artifact_type, string]]
+          return: string
+          body:
+            - decl: [ref, ptr<ufo.kit.Reference>, { new: ufo.kit.Reference }]
+            - if: { condition: { neq: [{ call: [ref.parse, reference] }, 0] }, then: [{ return: [{ call: [<.fail, ref.error] }] }] }
+            - if: { condition: { eq: [ref.tag.len, 0] }, then: [{ return: [{ call: [<.fail, "${reference}: push needs a tag"] }] }] }
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [man_hex, string, { call: [lay.manifest_for, layout, ""] }]
+            - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - if:
+                condition: { gt: [artifact_type.len, 0] }
+                then:
+                  - set: [man_hex, { call: [lay.with_artifact_type, layout, man_hex, artifact_type] }]
+                  - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [dest, string, "${<.root}/${ref.repo}/${ref.tag}"]
+            - call: [io.remove_all, dest]
+            - decl: [err, string, { call: [<.transfer, layout, man_hex, dest, ref.tag] }]
+            - if: { condition: { gt: [err.len, 0] }, then: [{ call: [io.remove_all, dest] }, { return: [{ call: [<.fail, err] }] }] }
+            - return: ["sha256:${man_hex}"]
+
+      # The tag directory holding manifest `digest` ("" if none).
+      - def:
+          name: find_digest
+          static_off: ["str_cmp"]
+          args: [[repo_dir, string], [digest, string]]
+          return: string
+          body:
+            - if: { condition: { not: [{ call: [io.is_dir, repo_dir] }] }, then: [{ return: [""] }] }
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [items, list<path>, { call: [io.list_dir, repo_dir] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, items.len] }
+                body:
+                  - decl: [cand, string, { at: [items, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [hex, string, { call: [lay.manifest_for, cand, ""] }]
+                  - if: { condition: { eq: ["sha256:${hex}", digest] }, then: [{ return: [cand] }] }
+            - return: [""]
+
+      - def:
+          name: pull
+          args: [[reference, string], [layout, string]]
+          return: string
+          body:
+            - decl: [ref, ptr<ufo.kit.Reference>, { new: ufo.kit.Reference }]
+            - if: { condition: { neq: [{ call: [ref.parse, reference] }, 0] }, then: [{ return: [{ call: [<.fail, ref.error] }] }] }
+            - decl: [src, string, "${<.root}/${ref.repo}/${ref.tag}"]
+            - if: { condition: { gt: [ref.digest.len, 0] }, then: [{ set: [src, { call: [<.find_digest, "${<.root}/${ref.repo}", ref.digest] }] }] }
+            - if: { condition: { or: [{ eq: [src.len, 0] }, { not: [{ call: [io.is_dir, src] }] }] }, then: [{ return: [{ call: [<.fail, "${reference}: not in ${<.root}"] }] }] }
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [man_hex, string, { call: [lay.manifest_for, src, ""] }]
+            - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [ref_name, string, lay.ref_name]
+            - call: [io.mkdir_all, layout]
+            - decl: [err, string, { call: [<.transfer, src, man_hex, layout, ref_name] }]
+            - if: { condition: { gt: [err.len, 0] }, then: [{ return: [{ call: [<.fail, err] }] }] }
+            - return: ["sha256:${man_hex}"]

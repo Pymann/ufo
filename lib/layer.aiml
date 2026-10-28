@@ -40,6 +40,7 @@
       - [note, string, ""]
       - [bindings, list<string>]
       - [bases, list<string>]
+      - [extra, list<string>]        # further trailer lines "Key: value"
 
 - def:
     name: octal
@@ -158,6 +159,12 @@
           body:
             - set: [out, "${out}Ufo-Base: ${{ call: [meta.bases.get, sdx] }}\n"]
             - set: [sdx, { +: [sdx, 1] }]
+      - decl: [xdx, i32, 0]
+      - while:
+          condition: { lt: [xdx, meta.extra.len] }
+          body:
+            - set: [out, "${out}${{ call: [meta.extra.get, xdx] }}\n"]
+            - set: [xdx, { +: [xdx, 1] }]
       - return: [out]
 
 # ── upper directory → tree ───────────────────────────────────────────────────

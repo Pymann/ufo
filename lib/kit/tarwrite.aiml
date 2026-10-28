@@ -1,0 +1,330 @@
+# ufo.kit.TarWriter — a directory as a POSIX (pax) tar, deterministic and
+# streaming (doc/kit.md §2.1).
+#
+#   entries sorted by name, numeric uid/gid, perm bits incl. setuid/sticky,
+#   mtime from the file (seconds), no atime/ctime, empty uname/gname, a fixed pax
+#   header name — the same tree always gives the same bytes.
+#   file contents are streamed (bytes.copy_range), never loaded.
+#   pax records only where ustar cannot say it: long path / link target,
+#   xattrs (SCHILY.xattr.*), ids or sizes beyond the octal fields.
+#
+# With `overlay` = 1 the directory is an overlayfs upper: a char device 0:0
+# becomes an empty `.wh.<name>`, a directory with *.overlay.opaque=y gets an
+# empty `.wh..wh..opq`, *.overlay.* xattrs are not written.  Markers are 0:0,
+# 0644 and carry the mtime of what they replace.
+- namespace: ufo.kit
+
+- import: "../layer.aiml"
+- import: "../tarlayer.aiml"
+
+- class:
+    name: TarWriter
+    members:
+      - [out, string, "", { access: public }]
+      - [overlay, i32, 0, { access: public }]
+      - [entries, i64, 0, { access: public }]
+      - [error, string, "", { access: public }]
+      - [links, map<string:string>]
+      - [zeros, buffer<u8>]
+    methods:
+      - def:
+          name: zero
+          args: [[count, i64]]
+          return: buffer<u8>
+          body:
+            - if:
+                condition: { eq: [<.zeros.len, 0] }
+                then:
+                  - decl: [hex, string, ""]
+                  - decl: [idx, i32, 0]
+                  - while:
+                      condition: { lt: [idx, 512] }
+                      body:
+                        - set: [hex, "${hex}00"]
+                        - set: [idx, { +: [idx, 1] }]
+                  - set: [<.zeros, { call: [bytes.from_hex, hex] }]
+            - return: [{ call: [bytes.slice, <.zeros, 0, count] }]
+
+      # A NUL-padded text field of `width` bytes (truncated if longer).
+      - def:
+          name: text_field
+          args: [[text, string], [width, i32]]
+          return: buffer<u8>
+          body:
+            - decl: [raw, buffer<u8>, { call: [bytes.from_string, text] }]
+            - if: { condition: { gt: [raw.len, width] }, then: [{ set: [raw, { call: [bytes.slice, raw, 0, width] }] }] }
+            - decl: [pad, buffer<u8>, { call: [<.zero, { -: [width, raw.len] }] }]
+            - return: [{ call: [bytes.concat, raw, pad] }]
+
+      # An octal number field: width-1 digits, then NUL.
+      - def:
+          name: num_field
+          args: [[value, i64], [width, i32]]
+          return: buffer<u8>
+          body:
+            - decl: [digits, string, { call: [ufo.layer.octal, value, { -: [width, 1] }] }]
+            - decl: [raw, buffer<u8>, { call: [bytes.from_string, digits] }]
+            - decl: [nul, buffer<u8>, { call: [<.zero, 1] }]
+            - return: [{ call: [bytes.concat, raw, nul] }]
+
+      # One pax record "<len> key=value\n" (value may be binary).
+      - def:
+          name: pax_record
+          args: [[key, string], [value, buffer<u8>]]
+          return: buffer<u8>
+          body:
+            - decl: [body_len, i64, { +: [{ +: [key.len, value.len] }, 3] }]   # " " "=" "\n"
+            - decl: [total, i64, { +: [body_len, 1] }]
+            - decl: [txt, string, "${total}"]
+            - while:
+                condition: { neq: [{ +: [body_len, txt.len] }, total] }
+                body:
+                  - set: [total, { +: [body_len, txt.len] }]
+                  - set: [txt, "${total}"]
+            - decl: [head, buffer<u8>, { call: [bytes.from_string, "${total} ${key}="] }]
+            - decl: [tail, buffer<u8>, { call: [bytes.from_string, "\n"] }]
+            - return: [{ call: [bytes.concat, { call: [bytes.concat, head, value] }, tail] }]
+
+      # The 512-byte ustar header of `ent` (ent.rel is the raw tar name here).
+      - def:
+          name: header
+          args: [[ent, ref<ufo.tarlayer.TarEntry>]]
+          return: buffer<u8>
+          body:
+            - decl: [hdr, buffer<u8>, { call: [<.text_field, ent.rel, 100] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.num_field, ent.mode, 8] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.num_field, ent.uid, 8] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.num_field, ent.gid, 8] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.num_field, ent.size, 12] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.num_field, ent.mtime, 12] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [bytes.from_string, "        "] }] }]   # chksum: spaces while summing
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [bytes.from_u8, ent.flag] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.text_field, ent.link, 100] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [bytes.from_hex, "757374617200"] }] }]   # "ustar\0"
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [bytes.from_string, "00"] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.zero, 64] }] }]                       # uname, gname
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.num_field, ent.dmaj, 8] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.num_field, ent.dmin, 8] }] }]
+            - set: [hdr, { call: [bytes.concat, hdr, { call: [<.zero, 167] }] }]                      # prefix + pad
+            - decl: [sum, i64, 0]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, 512] }
+                body:
+                  - set: [sum, { +: [sum, { call: [bytes.u8, hdr, idx] }] }]
+                  - set: [idx, { +: [idx, 1] }]
+            - decl: [chk, buffer<u8>, { call: [bytes.from_string, { call: [ufo.layer.octal, sum, 6] }] }]
+            - set: [chk, { call: [bytes.concat, chk, { call: [bytes.from_hex, "0020"] }] }]
+            - decl: [front, buffer<u8>, { call: [bytes.slice, hdr, 0, 148] }]
+            - decl: [back, buffer<u8>, { call: [bytes.slice, hdr, 156, 356] }]
+            - return: [{ call: [bytes.concat, { call: [bytes.concat, front, chk] }, back] }]
+
+      - def:
+          name: emit
+          args: [[data, buffer<u8>]]
+          return: i32
+          body:
+            - if: { condition: { lt: [{ call: [bytes.append_file, <.out, data] }, 0] }, then: [{ set: [<.error, "cannot write ${<.out}"] }, { return: [1] }] }
+            - return: [0]
+
+      # Header (+ pax header when needed) and, for a regular file, its content
+      # streamed from `content`.  xattrs are read from `xattr_src` ("" = none).
+      - def:
+          name: entry
+          static_off: ["str_cmp"]
+          args: [[ent, ref<ufo.tarlayer.TarEntry>], [xattr_src, string], [content, string]]
+          return: i32
+          body:
+            - decl: [size, i64, ent.size]
+            - decl: [pax, buffer<u8>, { call: [bytes.from_string, ""] }]
+            - decl: [name_raw, buffer<u8>, { call: [bytes.from_string, ent.rel] }]
+            - if: { condition: { gt: [name_raw.len, 100] }, then: [{ set: [pax, { call: [bytes.concat, pax, { call: [<.pax_record, "path", name_raw] }] }] }] }
+            - decl: [link_raw, buffer<u8>, { call: [bytes.from_string, ent.link] }]
+            - if: { condition: { gt: [link_raw.len, 100] }, then: [{ set: [pax, { call: [bytes.concat, pax, { call: [<.pax_record, "linkpath", link_raw] }] }] }] }
+            - if: { condition: { gt: [ent.uid, 2097151] }, then: [{ set: [pax, { call: [bytes.concat, pax, { call: [<.pax_record, "uid", { call: [bytes.from_string, "${ent.uid}"] }] }] }] }, { set: [ent.uid, 0] }] }
+            - if: { condition: { gt: [ent.gid, 2097151] }, then: [{ set: [pax, { call: [bytes.concat, pax, { call: [<.pax_record, "gid", { call: [bytes.from_string, "${ent.gid}"] }] }] }] }, { set: [ent.gid, 0] }] }
+            - if: { condition: { gt: [size, 8589934591] }, then: [{ set: [pax, { call: [bytes.concat, pax, { call: [<.pax_record, "size", { call: [bytes.from_string, "${size}"] }] }] }] }, { set: [ent.size, 0] }] }
+            - if:
+                condition: { gt: [xattr_src.len, 0] }
+                then:
+                  - decl: [names_txt, string, { call: [fsmeta.xattrs, xattr_src] }]
+                  - if:
+                      condition: { gt: [names_txt.len, 0] }
+                      then:
+                        - decl: [names, list<string>, { call: [names_txt.split, "\n"] }]
+                        - call: [names.sort]
+                        - decl: [ndx, i32, 0]
+                        - while:
+                            condition: { lt: [ndx, names.len] }
+                            body:
+                              - decl: [xname, string, { call: [names.get, ndx] }]
+                              - set: [ndx, { +: [ndx, 1] }]
+                              - decl: [skip, i32, 0]
+                              - if: { condition: { eq: [xname.len, 0] }, then: [{ set: [skip, 1] }] }
+                              - if: { condition: { eq: [{ call: [xname.starts_with, "trusted.overlay."] }, 1] }, then: [{ set: [skip, 1] }] }
+                              - if: { condition: { eq: [{ call: [xname.starts_with, "user.overlay."] }, 1] }, then: [{ set: [skip, 1] }] }
+                              - if:
+                                  condition: { eq: [skip, 0] }
+                                  then:
+                                    - decl: [xval, buffer<u8>, { call: [fsmeta.xattr_get, xattr_src, xname] }]
+                                    - set: [pax, { call: [bytes.concat, pax, { call: [<.pax_record, "SCHILY.xattr.${xname}", xval] }] }]
+            - if:
+                condition: { gt: [pax.len, 0] }
+                then:
+                  - decl: [phead, ptr<ufo.tarlayer.TarEntry>, { new: ufo.tarlayer.TarEntry }]
+                  - set: [phead.rel, "PaxHeaders/entry"]
+                  - set: [phead.mode, 420]
+                  - set: [phead.size, pax.len]
+                  - set: [phead.mtime, ent.mtime]
+                  - set: [phead.flag, 120]
+                  - if: { condition: { neq: [{ call: [<.emit, { call: [<.header, phead] }] }, 0] }, then: [{ return: [1] }] }
+                  - if: { condition: { neq: [{ call: [<.emit, pax] }, 0] }, then: [{ return: [1] }] }
+                  - decl: [ppad, i64, { band: [{ -: [512, { band: [pax.len, 511] }] }, 511] }]
+                  - if: { condition: { gt: [ppad, 0] }, then: [{ if: { condition: { neq: [{ call: [<.emit, { call: [<.zero, ppad] }] }, 0] }, then: [{ return: [1] }] } }] }
+            - if: { condition: { neq: [{ call: [<.emit, { call: [<.header, ent] }] }, 0] }, then: [{ return: [1] }] }
+            - set: [<.entries, { +: [<.entries, 1] }]
+            - if:
+                condition: { and: [{ gt: [size, 0] }, { gt: [content.len, 0] }] }
+                then:
+                  - decl: [copied, i64, { call: [bytes.copy_range, content, 0, size, <.out] }]
+                  - if: { condition: { neq: [copied, size] }, then: [{ set: [<.error, "cannot read ${content} (${copied} of ${size} bytes)"] }, { return: [1] }] }
+                  - decl: [cpad, i64, { band: [{ -: [512, { band: [size, 511] }] }, 511] }]
+                  - if: { condition: { gt: [cpad, 0] }, then: [{ if: { condition: { neq: [{ call: [<.emit, { call: [<.zero, cpad] }] }, 0] }, then: [{ return: [1] }] } }] }
+            - return: [0]
+
+      # An empty 0:0 0644 marker file (whiteout / opaque) with `mtime`.
+      - def:
+          name: marker
+          args: [[name, string], [mtime, i64]]
+          return: i32
+          body:
+            - decl: [mark, ptr<ufo.tarlayer.TarEntry>, { new: ufo.tarlayer.TarEntry }]
+            - set: [mark.rel, name]
+            - set: [mark.mode, 420]
+            - set: [mark.mtime, mtime]
+            - set: [mark.flag, 48]
+            - return: [{ call: [<.entry, mark, "", ""] }]
+
+      - def:
+          name: is_opaque
+          static_off: ["str_cmp"]
+          args: [[full, string]]
+          return: i32
+          body:
+            - decl: [one, buffer<u8>, { call: [fsmeta.xattr_get, full, "trusted.overlay.opaque"] }]
+            - if: { condition: { eq: [{ call: [bytes.text, one] }, "y"] }, then: [{ return: [1] }] }
+            - decl: [two, buffer<u8>, { call: [fsmeta.xattr_get, full, "user.overlay.opaque"] }]
+            - if: { condition: { eq: [{ call: [bytes.text, two] }, "y"] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      # The children of `dir` (relative path `rel`, "" at the top), sorted.
+      - def:
+          name: walk
+          static_off: ["str_cmp"]
+          args: [[dir, string], [rel, string]]
+          return: i32
+          body:
+            - decl: [names, list<string>]
+            - decl: [items, list<path>, { call: [io.list_dir, dir] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, items.len] }
+                body:
+                  - decl: [item, path, { call: [items.get, idx] }]
+                  - call: [names.push, { call: [item.name] }]
+                  - set: [idx, { +: [idx, 1] }]
+            - call: [names.sort]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, names.len] }
+                body:
+                  - decl: [name, string, { call: [names.get, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [full, string, "${dir}/${name}"]
+                  - decl: [relp, string, name]
+                  - if: { condition: { gt: [rel.len, 0] }, then: [{ set: [relp, "${rel}/${name}"] }] }
+                  - if: { condition: { neq: [{ call: [<.one, full, relp, name] }, 0] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      - def:
+          name: one
+          static_off: ["str_cmp"]
+          args: [[full, string], [relp, string], [name, string]]
+          return: i32
+          body:
+            - decl: [mode, i64, { call: [fsmeta.stat, full, 0] }]
+            - if: { condition: { lt: [mode, 0] }, then: [{ set: [<.error, "cannot stat ${full}"] }, { return: [1] }] }
+            - decl: [ftype, i64, { band: [mode, 61440] }]
+            - decl: [ent, ptr<ufo.tarlayer.TarEntry>, { new: ufo.tarlayer.TarEntry }]
+            - set: [ent.rel, relp]
+            - set: [ent.mode, { band: [mode, 4095] }]
+            - set: [ent.uid, { call: [fsmeta.stat, full, 1] }]
+            - set: [ent.gid, { call: [fsmeta.stat, full, 2] }]
+            - set: [ent.mtime, { call: [fsmeta.stat, full, 5] }]
+            - decl: [dmaj, i64, { call: [fsmeta.stat, full, 3] }]
+            - decl: [dmin, i64, { call: [fsmeta.stat, full, 4] }]
+            # directory
+            - if:
+                condition: { eq: [ftype, 16384] }
+                then:
+                  - set: [ent.rel, "${relp}/"]
+                  - set: [ent.flag, 53]
+                  - if: { condition: { neq: [{ call: [<.entry, ent, full, ""] }, 0] }, then: [{ return: [1] }] }
+                  - if:
+                      condition: { and: [{ eq: [<.overlay, 1] }, { eq: [{ call: [<.is_opaque, full] }, 1] }] }
+                      then:
+                        - if: { condition: { neq: [{ call: [<.marker, "${relp}/.wh..wh..opq", ent.mtime] }, 0] }, then: [{ return: [1] }] }
+                  - return: [{ call: [<.walk, full, relp] }]
+            # char device 0:0 in an upper: a whiteout
+            - if:
+                condition: { and: [{ eq: [<.overlay, 1] }, { and: [{ eq: [ftype, 8192] }, { and: [{ eq: [dmaj, 0] }, { eq: [dmin, 0] }] }] }] }
+                then:
+                  # same directory, name prefixed: "a/b/x" → "a/b/.wh.x"
+                  - decl: [dir_part, string, { call: [relp.substr, 0, { -: [relp.len, name.len] }] }]
+                  - return: [{ call: [<.marker, "${dir_part}.wh.${name}", ent.mtime] }]
+            - if:
+                condition: { eq: [ftype, 40960] }
+                then:
+                  - set: [ent.flag, 50]
+                  - set: [ent.link, { call: [io.read_link, full] }]
+                  - return: [{ call: [<.entry, ent, full, ""] }]
+            - set: [ent.dmaj, dmaj]
+            - set: [ent.dmin, dmin]
+            - if: { condition: { eq: [ftype, 8192] }, then: [{ set: [ent.flag, 51] }, { return: [{ call: [<.entry, ent, full, ""] }] }] }
+            - if: { condition: { eq: [ftype, 24576] }, then: [{ set: [ent.flag, 52] }, { return: [{ call: [<.entry, ent, full, ""] }] }] }
+            - set: [ent.dmaj, 0]
+            - set: [ent.dmin, 0]
+            - if: { condition: { eq: [ftype, 4096] }, then: [{ set: [ent.flag, 54] }, { return: [{ call: [<.entry, ent, full, ""] }] }] }
+            - if:
+                condition: { eq: [ftype, 32768] }
+                then:
+                  - set: [ent.flag, 48]
+                  - if:
+                      condition: { gt: [{ call: [fsmeta.stat, full, 8] }, 1] }
+                      then:
+                        - decl: [dev_no, i64, { call: [fsmeta.stat, full, 10] }]
+                        - decl: [ino_no, i64, { call: [fsmeta.stat, full, 9] }]
+                        - decl: [key, string, "${dev_no}:${ino_no}"]
+                        - if:
+                            condition: { eq: [{ call: [<.links.contains, key] }, 1] }
+                            then:
+                              - set: [ent.flag, 49]
+                              - set: [ent.link, { call: [<.links.get, key] }]
+                              - return: [{ call: [<.entry, ent, full, ""] }]
+                        - call: [<.links.put, key, relp]
+                  - set: [ent.size, { call: [fsmeta.stat, full, 7] }]
+                  - return: [{ call: [<.entry, ent, full, full] }]
+            # a socket has no tar form
+            - call: [log.warn, "ufo: ${full}: a socket — not written to the layer"]
+            - return: [0]
+
+      # The whole tar of `dir` into `out` (replaced).  0 = ok, error set otherwise.
+      - def:
+          name: write_dir
+          args: [[dir, string]]
+          return: i32
+          body:
+            - if: { condition: { call: [io.exists, <.out] }, then: [{ call: [io.remove, <.out] }] }
+            - call: [io.write_file, <.out, ""]
+            - if: { condition: { neq: [{ call: [<.walk, dir, ""] }, 0] }, then: [{ return: [1] }] }
+            - return: [{ call: [<.emit, { call: [bytes.concat, { call: [<.zero, 512] }, { call: [<.zero, 512] }] }] }]

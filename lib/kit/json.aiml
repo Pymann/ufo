@@ -1,0 +1,62 @@
+# ufo.kit.json — minimal JSON writing with a fixed key order (reproducible
+# digests: the same image always serializes to the same bytes).
+- namespace: ufo.kit
+
+- def:
+    name: jstr
+    args: [[text, string]]
+    return: string
+    body:
+      - decl: [raw, buffer<u8>, { call: [bytes.from_string, text] }]
+      - decl: [out, string, "\""]
+      - decl: [idx, i32, 0]
+      - decl: [hexd, string, "0123456789abcdef"]
+      - while:
+          condition: { lt: [idx, raw.len] }
+          body:
+            - decl: [chr, i32, { call: [bytes.u8, raw, idx] }]
+            - set: [idx, { +: [idx, 1] }]
+            - if:
+                condition: { eq: [chr, 34] }
+                then: [{ set: [out, "${out}\\\""] }]
+                else:
+                  - if:
+                      condition: { eq: [chr, 92] }
+                      then: [{ set: [out, "${out}\\\\"] }]
+                      else:
+                        - if:
+                            condition: { lt: [chr, 32] }
+                            then:
+                              - decl: [hig, i32, { shr: [chr, 4] }]
+                              - decl: [low, i32, { band: [chr, 15] }]
+                              - set: [out, "${out}\\u00${{ call: [hexd.substr, hig, 1] }}${{ call: [hexd.substr, low, 1] }}"]
+                            else:
+                              - set: [out, "${out}${{ call: [bytes.text, raw, { -: [idx, 1] }, 1] }}"]
+      - return: ["${out}\""]
+
+# {"k":"v",…} from parallel key/value lists, keys sorted.
+- def:
+    name: jobject
+    args: [[keys, list<string>], [vals, list<string>]]
+    return: string
+    body:
+      - decl: [order, list<string>]
+      - decl: [pos, map<string:i32>]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, keys.len] }
+          body:
+            - call: [order.push, { call: [keys.get, idx] }]
+            - call: [pos.put, { call: [keys.get, idx] }, idx]
+            - set: [idx, { +: [idx, 1] }]
+      - call: [order.sort]
+      - decl: [out, string, ""]
+      - set: [idx, 0]
+      - while:
+          condition: { lt: [idx, order.len] }
+          body:
+            - decl: [key, string, { call: [order.get, idx] }]
+            - if: { condition: { gt: [idx, 0] }, then: [{ set: [out, "${out},"] }] }
+            - set: [out, "${out}${{ call: [ufo.kit.jstr, key] }}:${{ call: [vals.get, { call: [pos.get, key] }] }}"]
+            - set: [idx, { +: [idx, 1] }]
+      - return: ["{${out}}"]

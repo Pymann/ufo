@@ -17,7 +17,10 @@ json() { python3 -c "import json,sys; j=json.load(open(sys.argv[1])); print($2)"
 [ -f "$MUSEUM_DIR/museum.aiml" ] || { echo "SKIP: no museum at $MUSEUM_DIR"; exit 0; }
 TOKEN=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1)
 mkdir -p "$WORK/data"
-(cd "$MUSEUM_DIR" && MUSEUM_ADMIN_TOKEN="$TOKEN" AIML_MEM_V3=1 "$AIML_BIN" museum.aiml -- "$PORT" "$WORK/data" > "$WORK/museum.log" 2>&1) & PIDS="$!"
+# a server already on the port would be tested instead of ours
+if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then echo "FAIL port $PORT is in use"; exit 1; fi
+# exec: $! is museum itself, so the trap stops it (not just the subshell)
+(cd "$MUSEUM_DIR" && MUSEUM_ADMIN_TOKEN="$TOKEN" AIML_MEM_V3=1 exec "$AIML_BIN" museum.aiml -- "$PORT" "$WORK/data" > "$WORK/museum.log" 2>&1) & PIDS="$!"
 for _ in $(seq 150); do curl -s -o /dev/null "http://127.0.0.1:$PORT/api/health" && break; sleep 0.2; done
 URL="http://127.0.0.1:$PORT"
 

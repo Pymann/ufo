@@ -1,0 +1,26 @@
+# OCI descriptors, as READ by ufo.kit (writing goes through json.aiml, keys sorted).
+- namespace: ufo.kit
+
+- model:
+    name: KitPlatform
+    fields:
+      - [architecture, string, ""]
+      - [osname, string, "", { alias: "os" }]
+      - [variant, string, ""]
+
+- model:
+    name: KitDesc
+    fields:
+      - [mediaType, string, ""]
+      - [digest, string, ""]
+      - [size, i64, 0]
+      - [annotations, map<string:string>]
+
+- model:
+    name: KitRef
+    fields:
+      - [mediaType, string, ""]
+      - [digest, string, ""]
+      - [size, i64, 0]
+      - [platform, ufo.kit.KitPlatform]
+      - [annotations, map<string:string>]
