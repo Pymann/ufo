@@ -35,7 +35,7 @@
     members:
       - [args, list<string>, null, { access: public }]
       - [dir, string, "."]
-      - [repo, ptr<ufo.repo.Repository>, null]
+      - [repo, shared<ufo.repo.Repository>, null]   # co-owned with LayerCli
       - [head_branch, string, ""]
     methods:
       # Collects argv (after the program name).
@@ -74,7 +74,7 @@
           name: open_repo
           return: i32
           body:
-            - set: [<.repo, { new: ufo.repo.Repository }]
+            - set: [<.repo, { share: { new: ufo.repo.Repository } }]
             - return: [{ call: [<.repo.open, <.dir] }]
 
       - def:
@@ -119,13 +119,8 @@
                 condition: { eq: [cmd, "layer"] }
                 then:
                   - decl: [lcli, ptr<ufo.layercli.LayerCli>, { new: ufo.layercli.LayerCli }]
-                  - decl: [adx, i32, 0]
-                  - while:
-                      condition: { lt: [adx, <.args.len] }
-                      body:
-                        - call: [lcli.args.push, { call: [<.args.get, adx] }]
-                        - set: [adx, { +: [adx, 1] }]
-                  - call: [lcli.open, <.dir]
+                  - set: [lcli.args, <.args]
+                  - set: [lcli.repo, <.repo]
                   - set: [lcli.author, { call: [ufo.cli.identity, "COMMITTER"] }]
                   - return: [{ call: [lcli.run, first] }]
             - return: [{ call: [<.fail, "unknown command '${cmd}'"] }]
@@ -150,7 +145,7 @@
                       else: [{ set: [target, one] }]
                   - set: [idx, { +: [idx, 1] }]
             - call: [io.mkdir_all, target]
-            - set: [<.repo, { new: ufo.repo.Repository }]
+            - set: [<.repo, { share: { new: ufo.repo.Repository } }]
             - call: [<.repo.create, target, bare, "main"]
             - print: ["Initialized empty git repository in ${<.repo.git_dir}"]
             - return: [0]
@@ -593,7 +588,7 @@
             - decl: [target, string, { call: [<.arg, { +: [pos, 1] }] }]
             - if: { condition: { or: [{ eq: [url.len, 0] }, { eq: [target.len, 0] }] }, then: [{ return: [{ call: [<.fail, "usage: ufo clone <url> <dir>"] }] }] }
             - call: [io.mkdir_all, target]
-            - set: [<.repo, { new: ufo.repo.Repository }]
+            - set: [<.repo, { share: { new: ufo.repo.Repository } }]
             - call: [<.repo.create, target, 0, "main"]
             - decl: [config, string, { call: [io.read_file, "${<.repo.git_dir}/config"] }]
             - call: [<.repo.write_text, "${<.repo.git_dir}/config", "${config}[remote \"origin\"]\n\turl = ${url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"]

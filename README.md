@@ -114,7 +114,8 @@ stored once), and `.ufo-attributes` and `.ufo-keep` are reserved names.
 ## Building
 
 ufo needs an aiml compiler with the `bytes`, `hash.sha1` and `fsmeta`
-builtins (aiml branch `feature/git-support-memv3`, merged into
+builtins and method calls on `shared<Class>` (aiml branches `feature/git-support-memv3` and
+`fix/shared-method-call-memv3`, both merged into
 `ecosystem/integration-memv3`) and memV3 (`AIML_MEM_V3=1`).
 
 ```

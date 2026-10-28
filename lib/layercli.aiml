@@ -26,17 +26,9 @@
     name: LayerCli
     members:
       - [args, list<string>, null, { access: public }]
-      - [repo, ptr<ufo.repo.Repository>, null]
+      - [repo, shared<ufo.repo.Repository>, null, { access: public }]   # the Cli's repository, co-owned
       - [author, string, "", { access: public }]
     methods:
-      - def:
-          name: open
-          args: [[dir, string]]
-          return: i32
-          body:
-            - set: [<.repo, { new: ufo.repo.Repository }]
-            - return: [{ call: [<.repo.open, dir] }]
-
       - def:
           name: arg
           args: [[pos, i32]]
