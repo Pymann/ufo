@@ -98,3 +98,33 @@
                             then:
                               - decl: [text, string, { call: [bytes.text, body] }]
                               - if: { condition: { eq: [{ call: [text.starts_with, "object "] }, 1] }, then: [{ call: [stack.push, { call: [text.substr, 7, 40] }] }] }
+
+# Is commit `ancestor` reachable from commit `descendant` (or equal)?
+- def:
+    name: is_ancestor
+    args: [[repo, ref<ufo.repo.Repository>], [ancestor, string], [descendant, string]]
+    return: i32
+    body:
+      - if: { condition: { eq: [ancestor, descendant] }, then: [{ return: [1] }] }
+      - decl: [seen, map<string:i32>]
+      - decl: [queue, list<string>]
+      - call: [queue.push, descendant]
+      - decl: [head, i32, 0]
+      - while:
+          condition: { lt: [head, queue.len] }
+          body:
+            - decl: [oid, string, { call: [queue.get, head] }]
+            - set: [head, { +: [head, 1] }]
+            - if:
+                condition: { eq: [{ call: [seen.contains, oid] }, 0] }
+                then:
+                  - call: [seen.put, oid, 1]
+                  - if: { condition: { eq: [oid, ancestor] }, then: [{ return: [1] }] }
+                  - decl: [cmt, ufo.object.Commit, { call: [repo.read_commit, oid] }]
+                  - decl: [pdx, i32, 0]
+                  - while:
+                      condition: { lt: [pdx, cmt.parents.len] }
+                      body:
+                        - call: [queue.push, { call: [cmt.parents.get, pdx] }]
+                        - set: [pdx, { +: [pdx, 1] }]
+      - return: [0]

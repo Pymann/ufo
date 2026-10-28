@@ -598,7 +598,7 @@
                   - print: ["checked out ${short} (${written} file(s))"]
             - return: [0]
 
-      # push <remote|url> <src>[:<dst>]…  (":<dst>" deletes; "+" is accepted and ignored)
+      # push <remote|url> [+]<src>[:<dst>]…  (":<dst>" deletes, "+" forces a non-fast-forward)
       - def:
           name: cmd_push
           args: [[pos, i32]]
@@ -613,7 +613,8 @@
                 body:
                   - decl: [spec, string, { call: [<.arg, idx] }]
                   - set: [idx, { +: [idx, 1] }]
-                  - if: { condition: { eq: [{ call: [spec.starts_with, "+"] }, 1] }, then: [{ set: [spec, { call: [spec.substr, 1] }] }] }
+                  - decl: [forced, i32, 0]
+                  - if: { condition: { eq: [{ call: [spec.starts_with, "+"] }, 1] }, then: [{ set: [spec, { call: [spec.substr, 1] }] }, { set: [forced, 1] }] }
                   - decl: [colon, i32, { call: [spec.index_of, ":"] }]
                   - decl: [src, string, spec]
                   - decl: [dst, string, spec]
@@ -625,6 +626,7 @@
                   - if: { condition: { eq: [{ call: [dst.starts_with, "refs/"] }, 0] }, then: [{ set: [dst, "refs/heads/${dst}"] }] }
                   - decl: [upd, ufo.remote.RefUpdate]
                   - set: [upd.name, dst]
+                  - set: [upd.force, forced]
                   - set: [upd.new_oid, { call: [ufo.remote.zero_id] }]
                   - if:
                       condition: { gt: [src.len, 0] }

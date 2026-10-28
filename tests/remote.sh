@@ -35,7 +35,8 @@ for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$PORT/source.git/i
 URL="http://127.0.0.1:$PORT"
 
 echo "fetch"
-check "ls-remote" "$($UFO ls-remote "$URL/source.git" | sort)" "$(git ls-remote "$WORK/srv/source.git" | grep -v '\^{}' | sort)"
+check "ls-remote" "$($UFO ls-remote "$URL/source.git" | grep -v HEAD | sort)" "$(git ls-remote "$WORK/srv/source.git" | grep -v '\^{}' | grep -v HEAD | sort)"
+check "ls-remote: HEAD" "$($UFO ls-remote "$URL/source.git" | grep -c 'HEAD$')" "1"
 $UFO clone "$URL/source.git" "$WORK/clone" > "$WORK/clone.log" 2>&1
 check "clone: HEAD" "$(git -C "$WORK/clone" rev-parse HEAD)" "$(git -C "$WORK/seed" rev-parse main)"
 check "clone: git fsck" "$(git -C "$WORK/clone" fsck --strict 2>&1 | grep -vc '^Checking\|^notice')" "0"
@@ -72,6 +73,9 @@ check "push again: up to date" "$($UFO -C "$WORK/mine" push "$URL/target.git" ma
 check "delete ref" "$($UFO -C "$WORK/mine" push "$URL/target.git" :refs/layers/demo/build)" "ok refs/layers/demo/build "
 check "ref gone" "$(git -C "$WORK/srv/target.git" show-ref | grep -c layers)" "0"
 check "non-fast-forward is refused" "$($UFO -C "$WORK/mine" push "$URL/target.git" "$C1:main" 2>&1 | grep -c '^ng refs/heads/main')" "1"
+check "server unchanged" "$(git -C "$WORK/srv/target.git" rev-parse main)" "$C2"
+check "+ forces it" "$($UFO -C "$WORK/mine" push "$URL/target.git" "+$C1:main")" "ok refs/heads/main "
+check "server rewound" "$(git -C "$WORK/srv/target.git" rev-parse main)" "$C1"
 
 echo "auth"
 kill $PIDS 2>/dev/null; sleep 0.3

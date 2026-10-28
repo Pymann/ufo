@@ -29,6 +29,7 @@
       - [new_oid, string, ""]     # what it should get ("0"*40 = delete)
       - [status, string, ""]      # "ok" / "ng" / "" (not reported)
       - [reason, string, ""]
+      - [force, i32, 0]           # "+src:dst": allow a non-fast-forward update
 
 - def:
     name: zero_id
@@ -357,6 +358,14 @@
                   - if:
                       condition: { eq: [upd.old_oid, upd.new_oid] }
                       then: [{ set: [upd.status, "ok"] }, { set: [upd.reason, "up to date"] }]
+                  # like git: refuse to rewind a ref unless forced
+                  - decl: [zero, string, { call: [ufo.remote.zero_id] }]
+                  - if:
+                      condition: { and: [{ eq: [upd.status.len, 0] }, { and: [{ eq: [upd.force, 0] }, { and: [{ neq: [upd.old_oid, zero] }, { neq: [upd.new_oid, zero] }] }] }] }
+                      then:
+                        - decl: [fast_fwd, i32, 0]
+                        - if: { condition: { eq: [{ call: [repo.has, upd.old_oid] }, 1] }, then: [{ set: [fast_fwd, { call: [ufo.walk.is_ancestor, repo, upd.old_oid, upd.new_oid] }] }] }
+                        - if: { condition: { eq: [fast_fwd, 0] }, then: [{ set: [upd.status, "ng"] }, { set: [upd.reason, "non-fast-forward (prefix the refspec with + to force)"] }] }
                   - call: [plan.push, upd]
                   - set: [udx, { +: [udx, 1] }]
             # request: commands, flush, pack
