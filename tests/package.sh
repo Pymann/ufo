@@ -1,0 +1,41 @@
+#!/bin/bash
+# Package → museum → download → run: the exodus distribution path end to end.
+#   AIML_BIN=/path/to/aiml MUSEUM_DIR=../museum tests/package.sh
+set -u
+cd "$(dirname "$0")/.."
+AIML_BIN="${AIML_BIN:-aiml}"
+MUSEUM_DIR="${MUSEUM_DIR:-../museum}"
+PORT="${PORT:-18233}"
+WORK="$(mktemp -d)"
+PIDS=""
+trap 'kill $PIDS 2>/dev/null; rm -rf "$WORK"' EXIT
+FAILS=0; PASSES=0
+pass() { PASSES=$((PASSES + 1)); echo "  ok   $1"; }
+fail() { FAILS=$((FAILS + 1)); echo "  FAIL $1"; }
+check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: got '$2' want '$3'"; fi; }
+[ -f "$MUSEUM_DIR/museum.aiml" ] || { echo "SKIP: no museum at $MUSEUM_DIR"; exit 0; }
+VERSION="$(python3 -c 'import json; print(json.load(open("exodus.json"))["version"])')"
+
+A="$(scripts/package.sh "$WORK/a")"; B="$(scripts/package.sh "$WORK/b")"
+check "archive is reproducible" "$(cmp -s "$A" "$B" && echo same)" "same"
+check "archive layout" "$(tar tzf "$A" | grep -cE "^ufo-$VERSION/(exodus.json|ufo.aiml|lib/layer.aiml|README.md)$")" "4"
+
+TOKEN=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1)
+mkdir -p "$WORK/data"
+(cd "$MUSEUM_DIR" && MUSEUM_ADMIN_TOKEN="$TOKEN" AIML_MEM_V3=1 "$AIML_BIN" museum.aiml -- "$PORT" "$WORK/data" > "$WORK/museum.log" 2>&1) & PIDS="$!"
+for _ in $(seq 150); do curl -s -o /dev/null "http://127.0.0.1:$PORT/api/health" && break; sleep 0.2; done
+MUSEUM_URL="http://127.0.0.1:$PORT" MUSEUM_TOKEN="$TOKEN" OUT="$WORK/pub" scripts/publish.sh > "$WORK/publish.log" 2>&1
+check "publish" "$?" "0"
+check "token not echoed" "$(grep -c "$TOKEN" "$WORK/publish.log")" "0"
+check "manifest from museum" "$(curl -s "http://127.0.0.1:$PORT/exodus/ufo/$VERSION/exodus.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')" "ufo"
+curl -s -o "$WORK/dl.tar.gz" "http://127.0.0.1:$PORT/exodus/ufo/$VERSION/package"
+check "package bytes" "$(sha256sum < "$WORK/dl.tar.gz")" "$(sha256sum < "$A")"
+mkdir -p "$WORK/consumer" && tar xzf "$WORK/dl.tar.gz" -C "$WORK/consumer"
+U="env AIML_MEM_V3=1 $AIML_BIN $WORK/consumer/ufo-$VERSION/ufo.aiml --"
+$U init "$WORK/r" > /dev/null 2>&1
+mkdir -p "$WORK/up/etc"; printf 'x\n' > "$WORK/up/etc/x"
+L=$($U -C "$WORK/r" layer commit "$WORK/up" -p pkg -s test 2>/dev/null)
+check "unpacked ufo runs" "$(git -C "$WORK/r" rev-parse refs/layers/pkg/test)" "$L"
+
+echo "$PASSES passed, $FAILS failed"
+[ "$FAILS" -eq 0 ]
