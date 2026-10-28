@@ -114,9 +114,9 @@ stored once), and `.ufo-attributes` and `.ufo-keep` are reserved names.
 ## Building
 
 ufo needs an aiml compiler with the `bytes`, `hash.sha1` and `fsmeta`
-builtins and method calls on `shared<Class>` (aiml branches `feature/git-support-memv3` and
-`fix/shared-method-call-memv3`, both merged into
-`ecosystem/integration-memv3`) and memV3 (`AIML_MEM_V3=1`).
+builtins and method calls on `shared<Class>` — aiml `mem-v3-compiler` from 34c3340 on
+(feature/git-support-memv3 and fix/shared-method-call-memv3 are merged there) — and memV3
+(`AIML_MEM_V3=1`).
 
 ```
 exodus build                      # ./ufo, with ../aiml as in exodus.json
