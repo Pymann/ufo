@@ -1,0 +1,170 @@
+# ufo.layerdiff — what changed between two layers (trees).
+#
+# Lines "<op> <path>": A added, D removed (from the layer), M modified,
+# W whiteout added, O opaque marker added; attribute lines "+a …" / "-a …".
+- namespace: ufo.layerdiff
+
+- import: "object.aiml"
+- import: "repo.aiml"
+
+- class:
+    name: Differ
+    members:
+      - [lines, list<string>, null, { access: public }]
+    methods:
+      - def:
+          name: entries
+          args: [[repo, ref<ufo.repo.Repository>], [tree, string]]
+          return: list<ufo.object.TreeEntry>
+          body:
+            - decl: [none, list<ufo.object.TreeEntry>]
+            - if: { condition: { neq: [tree.len, 40] }, then: [{ return: [none] }] }
+            - return: [{ call: [ufo.object.tree_decode, { call: [repo.read_body, tree] }] }]
+
+      - def:
+          name: emit
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [opc, string], [ent, ufo.object.TreeEntry], [prefix, string]]
+          body:
+            - decl: [full, string, "${prefix}${ent.name}"]
+            - if: { condition: { eq: [ent.name, ".ufo-keep"] }, then: [{ return: [] }] }
+            - if: { condition: { and: [{ eq: [prefix.len, 0] }, { eq: [ent.name, ".ufo-attributes"] }] }, then: [{ return: [] }] }
+            - if:
+                condition: { eq: [ent.mode, "40000"] }
+                then:
+                  - decl: [kids, list<ufo.object.TreeEntry>, { call: [<.entries, repo, ent.oid] }]
+                  - decl: [kdx, i32, 0]
+                  - while:
+                      condition: { lt: [kdx, kids.len] }
+                      body:
+                        - call: [<.emit, repo, opc, { at: [kids, kdx] }, "${full}/"]
+                        - set: [kdx, { +: [kdx, 1] }]
+                  - if:
+                      condition: { eq: [kids.len, 1] }
+                      then:
+                        - decl: [only, ufo.object.TreeEntry, { at: [kids, 0] }]
+                        - if: { condition: { eq: [only.name, ".ufo-keep"] }, then: [{ call: [<.lines.push, "${opc} ${full}/"] }] }
+                  - return: []
+            - if:
+                condition: { and: [{ eq: [opc, "A"] }, { eq: [ent.name, ".wh..wh..opq"] }] }
+                then: [{ call: [<.lines.push, "O ${prefix}"] }, { return: [] }]
+            - if:
+                condition: { and: [{ eq: [opc, "A"] }, { eq: [{ call: [ent.name.starts_with, ".wh."] }, 1] }] }
+                then: [{ call: [<.lines.push, "W ${prefix}${{ call: [ent.name.substr, 4] }}"] }, { return: [] }]
+            - call: [<.lines.push, "${opc} ${full}"]
+
+      - def:
+          name: diff
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [old_tree, string], [new_tree, string], [prefix, string]]
+          body:
+            - if: { condition: { eq: [old_tree, new_tree] }, then: [{ return: [] }] }
+            - decl: [olds, list<ufo.object.TreeEntry>, { call: [<.entries, repo, old_tree] }]
+            - decl: [news, list<ufo.object.TreeEntry>, { call: [<.entries, repo, new_tree] }]
+            - decl: [old_at, map<string:i32>]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, olds.len] }
+                body:
+                  - decl: [prior, ufo.object.TreeEntry, { at: [olds, idx] }]
+                  - call: [old_at.put, prior.name, idx]
+                  - set: [idx, { +: [idx, 1] }]
+            - decl: [new_at, map<string:i32>]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, news.len] }
+                body:
+                  - decl: [one, ufo.object.TreeEntry, { at: [news, idx] }]
+                  - call: [new_at.put, one.name, idx]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if:
+                      condition: { eq: [{ call: [old_at.contains, one.name] }, 0] }
+                      then:
+                        - call: [<.emit, repo, "A", one, prefix]
+                      else:
+                        - decl: [was, ufo.object.TreeEntry, { at: [olds, { call: [old_at.get, one.name] }] }]
+                        - if:
+                            condition: { or: [{ neq: [was.oid, one.oid] }, { neq: [was.mode, one.mode] }] }
+                            then:
+                              - if:
+                                  condition: { and: [{ eq: [was.mode, "40000"] }, { eq: [one.mode, "40000"] }] }
+                                  then:
+                                    - call: [<.diff, repo, was.oid, one.oid, "${prefix}${one.name}/"]
+                                  else:
+                                    - if:
+                                        condition: { or: [{ eq: [was.mode, "40000"] }, { eq: [one.mode, "40000"] }] }
+                                        then:
+                                          - call: [<.emit, repo, "D", was, prefix]
+                                          - call: [<.emit, repo, "A", one, prefix]
+                                        else:
+                                          - if: { condition: { and: [{ eq: [prefix.len, 0] }, { eq: [one.name, ".ufo-attributes"] }] }, then: [{ return: [] }] }
+                                          - call: [<.lines.push, "M ${prefix}${one.name}"]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, olds.len] }
+                body:
+                  - decl: [gone, ufo.object.TreeEntry, { at: [olds, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if: { condition: { eq: [{ call: [new_at.contains, gone.name] }, 0] }, then: [{ call: [<.emit, repo, "D", gone, prefix] }] }
+
+      # Paths, then attributes ("" tree = empty layer).
+      - def:
+          name: run
+          args: [[repo, ref<ufo.repo.Repository>], [old_tree, string], [new_tree, string]]
+          return: list<string>
+          body:
+            - decl: [fresh, list<string>]
+            - set: [<.lines, fresh]
+            - call: [<.diff, repo, old_tree, new_tree, ""]
+            - call: [<.lines.sort]
+            - decl: [olds, list<string>, { call: [<.attr_lines, repo, old_tree] }]
+            - decl: [news, list<string>, { call: [<.attr_lines, repo, new_tree] }]
+            - decl: [old_set, map<string:i32>]
+            - decl: [new_set, map<string:i32>]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, olds.len] }
+                body:
+                  - call: [old_set.put, { call: [olds.get, idx] }, 1]
+                  - set: [idx, { +: [idx, 1] }]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, news.len] }
+                body:
+                  - call: [new_set.put, { call: [news.get, idx] }, 1]
+                  - set: [idx, { +: [idx, 1] }]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, olds.len] }
+                body:
+                  - decl: [line, string, { call: [olds.get, idx] }]
+                  - if: { condition: { eq: [{ call: [new_set.contains, line] }, 0] }, then: [{ call: [<.lines.push, "-a ${line}"] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, news.len] }
+                body:
+                  - decl: [line, string, { call: [news.get, idx] }]
+                  - if: { condition: { eq: [{ call: [old_set.contains, line] }, 0] }, then: [{ call: [<.lines.push, "+a ${line}"] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [<.lines]
+
+      - def:
+          name: attr_lines
+          args: [[repo, ref<ufo.repo.Repository>], [tree, string]]
+          return: list<string>
+          body:
+            - decl: [out, list<string>]
+            - if: { condition: { neq: [tree.len, 40] }, then: [{ return: [out] }] }
+            - decl: [attr_id, string, { call: [repo.at_path, tree, ".ufo-attributes"] }]
+            - if: { condition: { neq: [attr_id.len, 40] }, then: [{ return: [out] }] }
+            - decl: [text, string, { call: [bytes.text, { call: [repo.read_body, attr_id] }] }]
+            - decl: [all, list<string>, { call: [text.split, "\n"] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, all.len] }
+                body:
+                  - decl: [line, string, { call: [all.get, idx] }]
+                  - if: { condition: { gt: [line.len, 0] }, then: [{ call: [out.push, line] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [out]

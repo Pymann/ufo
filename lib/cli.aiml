@@ -18,7 +18,8 @@
 #   index-pack <file.pack>           write the .idx for a pack
 #   verify-pack <base>               read every object of a pack back and check its id
 #
-# Layers and remotes have their own commands (see README).
+# Remotes: clone, ls-remote, remote add, fetch, push (see remote.aiml).
+# Layers:  layer commit|apply|list|log|show|diff (see layercli.aiml).
 
 - namespace: ufo.cli
 
@@ -27,6 +28,7 @@
 - import: "worktree.aiml"
 - import: "packwrite.aiml"
 - import: "remote.aiml"
+- import: "layercli.aiml"
 
 - class:
     name: Cli
@@ -113,6 +115,19 @@
             - if: { condition: { eq: [cmd, "remote"] }, then: [{ return: [{ call: [<.cmd_remote, first] }] }] }
             - if: { condition: { eq: [cmd, "fetch"] }, then: [{ return: [{ call: [<.cmd_fetch, first] }] }] }
             - if: { condition: { eq: [cmd, "push"] }, then: [{ return: [{ call: [<.cmd_push, first] }] }] }
+            - if:
+                condition: { eq: [cmd, "layer"] }
+                then:
+                  - decl: [lcli, ptr<ufo.layercli.LayerCli>, { new: ufo.layercli.LayerCli }]
+                  - decl: [adx, i32, 0]
+                  - while:
+                      condition: { lt: [adx, <.args.len] }
+                      body:
+                        - call: [lcli.args.push, { call: [<.args.get, adx] }]
+                        - set: [adx, { +: [adx, 1] }]
+                  - call: [lcli.open, <.dir]
+                  - set: [lcli.author, { call: [ufo.cli.identity, "COMMITTER"] }]
+                  - return: [{ call: [lcli.run, first] }]
             - return: [{ call: [<.fail, "unknown command '${cmd}'"] }]
 
       # ── commands ─────────────────────────────────────────────────────────

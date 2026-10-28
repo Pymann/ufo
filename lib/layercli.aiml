@@ -1,0 +1,306 @@
+# ufo.layercli — `ufo layer …`.
+#
+#   layer commit <upper-dir> --pipeline <p> --stage <s> [--run <r>] [--step <k>]
+#                [--agent <a>] [--binding <k=v>]… [--base <layer>]…
+#                [--uid-shift <n>] [-m <note>] [--no-ref]
+#                                   snapshot an overlay upper dir as a layer commit
+#                                   (parent: refs/layers/<p>/<s>, which moves on)
+#   layer apply <dir> <layer>… [--upper | --oci]
+#                                   stack layers onto <dir>, lowest first
+#                                   (--upper: overlay form, --oci: .wh. files)
+#   layer list [<pipeline>]         layer refs with their tips
+#   layer log <p>/<s>               the runs of a stage, newest first
+#   layer show <layer>              metadata and counts
+#   layer diff <old> <new>          what changed between two runs ("-" = nothing)
+#
+# <layer>: anything rev-parse takes, or <p>/<s>[~N] for refs/layers/<p>/<s>.
+
+- namespace: ufo.layercli
+
+- import: "object.aiml"
+- import: "repo.aiml"
+- import: "layer.aiml"
+- import: "layerdiff.aiml"
+
+- class:
+    name: LayerCli
+    members:
+      - [args, list<string>, null, { access: public }]
+      - [repo, ptr<ufo.repo.Repository>, null]
+      - [author, string, "", { access: public }]
+    methods:
+      - def:
+          name: open
+          args: [[dir, string]]
+          return: i32
+          body:
+            - set: [<.repo, { new: ufo.repo.Repository }]
+            - return: [{ call: [<.repo.open, dir] }]
+
+      - def:
+          name: arg
+          args: [[pos, i32]]
+          return: string
+          body:
+            - if: { condition: { ge: [pos, <.args.len] }, then: [{ return: [""] }] }
+            - return: [{ call: [<.args.get, pos] }]
+
+      - def:
+          name: fail
+          args: [[message, string]]
+          return: i32
+          body:
+            - call: [log.error, "ufo layer: ${message}"]
+            - return: [1]
+
+      - def:
+          name: rev
+          args: [[name, string]]
+          return: string
+          body:
+            - decl: [oid, string, { call: [<.repo.rev, name] }]
+            - if: { condition: { eq: [oid.len, 40] }, then: [{ return: [oid] }] }
+            - return: [{ call: [<.repo.rev, "refs/layers/${name}"] }]
+
+      - def:
+          name: run
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [sub, string, { call: [<.arg, pos] }]
+            - decl: [first, i32, { +: [pos, 1] }]
+            - if: { condition: { eq: [sub, "commit"] }, then: [{ return: [{ call: [<.cmd_commit, first] }] }] }
+            - if: { condition: { eq: [sub, "apply"] }, then: [{ return: [{ call: [<.cmd_apply, first] }] }] }
+            - if: { condition: { eq: [sub, "list"] }, then: [{ return: [{ call: [<.cmd_list, first] }] }] }
+            - if: { condition: { eq: [sub, "log"] }, then: [{ return: [{ call: [<.cmd_log, first] }] }] }
+            - if: { condition: { eq: [sub, "show"] }, then: [{ return: [{ call: [<.cmd_show, first] }] }] }
+            - if: { condition: { eq: [sub, "diff"] }, then: [{ return: [{ call: [<.cmd_diff, first] }] }] }
+            - return: [{ call: [<.fail, "usage: ufo layer (commit|apply|list|log|show|diff) …"] }]
+
+      - def:
+          name: cmd_commit
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [meta, ufo.layer.Meta]
+            - decl: [upper, string, ""]
+            - decl: [move_ref, i32, 1]
+            - decl: [shift, i64, 0]
+            - decl: [idx, i32, pos]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - decl: [flag, string, { call: [<.arg, idx] }]
+                  - decl: [value, string, { call: [<.arg, { +: [idx, 1] }] }]
+                  - decl: [took, i32, 2]
+                  - if: { condition: { or: [{ eq: [flag, "--pipeline"] }, { eq: [flag, "-p"] }] }, then: [{ set: [meta.pipeline, value] }], else: [
+                      { if: { condition: { or: [{ eq: [flag, "--stage"] }, { eq: [flag, "-s"] }] }, then: [{ set: [meta.stage, value] }], else: [
+                        { if: { condition: { eq: [flag, "--run"] }, then: [{ set: [meta.run, value] }], else: [
+                          { if: { condition: { eq: [flag, "--step"] }, then: [{ set: [meta.step, value] }], else: [
+                            { if: { condition: { eq: [flag, "--agent"] }, then: [{ set: [meta.agent, value] }], else: [
+                              { if: { condition: { eq: [flag, "--binding"] }, then: [{ call: [meta.bindings.push, value] }], else: [
+                                { if: { condition: { eq: [flag, "--uid-shift"] }, then: [{ set: [shift, { call: [value.to_int] }] }], else: [
+                                  { if: { condition: { eq: [flag, "-m"] }, then: [{ set: [meta.note, value] }], else: [
+                                    { if: { condition: { eq: [flag, "--base"] }, then: [{ call: [meta.bases.push, { call: [<.rev, value] }] }], else: [
+                                      { set: [took, 1] },
+                                      { if: { condition: { eq: [flag, "--no-ref"] }, then: [{ set: [move_ref, 0] }], else: [{ set: [upper, flag] }] } }
+                                    ] } }
+                                  ] } }
+                                ] } }
+                              ] } }
+                            ] } }
+                          ] } }
+                        ] } }
+                      ] } }
+                    ] }
+                  - set: [idx, { +: [idx, took] }]
+            - if: { condition: { eq: [upper.len, 0] }, then: [{ return: [{ call: [<.fail, "commit: which upper directory?"] }] }] }
+            - if: { condition: { not: [{ call: [io.is_dir, upper] }] }, then: [{ return: [{ call: [<.fail, "commit: ${upper} is not a directory"] }] }] }
+            - if: { condition: { eq: [{ call: [ufo.layer.valid_part, meta.pipeline, 1] }, 0] }, then: [{ return: [{ call: [<.fail, "commit: --pipeline missing or not a valid ref name"] }] }] }
+            - if: { condition: { eq: [{ call: [ufo.layer.valid_part, meta.stage, 0] }, 0] }, then: [{ return: [{ call: [<.fail, "commit: --stage missing or not a valid ref name (no /)"] }] }] }
+            - decl: [bdx, i32, 0]
+            - while:
+                condition: { lt: [bdx, meta.bases.len] }
+                body:
+                  - decl: [base, string, { call: [meta.bases.get, bdx] }]
+                  - if: { condition: { neq: [base.len, 40] }, then: [{ return: [{ call: [<.fail, "commit: unknown --base layer"] }] }] }
+                  - set: [bdx, { +: [bdx, 1] }]
+            - decl: [scan, ptr<ufo.layer.Scanner>, { new: ufo.layer.Scanner }]
+            - set: [scan.uid_shift, shift]
+            - decl: [tree, string, { call: [scan.scan, <.repo, upper] }]
+            - decl: [made, string, { call: [ufo.layer.commit, <.repo, tree, meta, <.author, move_ref] }]
+            - call: [log.info, "ufo: layer ${meta.pipeline}/${meta.stage}: ${scan.files} files, ${scan.whiteouts} whiteouts, ${scan.opaques} opaque, ${scan.specials} special, ${scan.attrs.len} attribute lines"]
+            - print: ["${made}"]
+            - return: [0]
+
+      - def:
+          name: cmd_apply
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [app, ptr<ufo.layer.Applier>, { new: ufo.layer.Applier }]
+            - decl: [target, string, ""]
+            - decl: [layers, list<string>]
+            - decl: [idx, i32, pos]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - decl: [one, string, { call: [<.arg, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if: { condition: { eq: [one, "--upper"] }, then: [{ set: [app.mode, 1] }], else: [
+                      { if: { condition: { eq: [one, "--oci"] }, then: [{ set: [app.mode, 2] }], else: [
+                        { if: { condition: { eq: [target.len, 0] }, then: [{ set: [target, one] }], else: [{ call: [layers.push, one] }] } }
+                      ] } }
+                    ] }
+            - if: { condition: { or: [{ eq: [target.len, 0] }, { eq: [layers.len, 0] }] }, then: [{ return: [{ call: [<.fail, "usage: ufo layer apply <dir> <layer>… [--upper|--oci]"] }] }] }
+            - call: [io.mkdir_all, target]
+            - decl: [ldx, i32, 0]
+            - while:
+                condition: { lt: [ldx, layers.len] }
+                body:
+                  - decl: [name, string, { call: [layers.get, ldx] }]
+                  - set: [ldx, { +: [ldx, 1] }]
+                  - decl: [oid, string, { call: [<.rev, name] }]
+                  - if: { condition: { neq: [oid.len, 40] }, then: [{ return: [{ call: [<.fail, "unknown layer ${name}"] }] }] }
+                  - if: { condition: { lt: [{ call: [app.apply, <.repo, oid, target] }, 0] }, then: [{ return: [{ call: [<.fail, "layer ${name} is incomplete in this repository"] }] }] }
+            - if: { condition: { gt: [app.owner_failed, 0] }, then: [{ call: [log.warn, "ufo: ${app.owner_failed} owners not set (needs root or a user namespace)"] }] }
+            - if: { condition: { gt: [app.failed, 0] }, then: [{ call: [log.warn, "ufo: ${app.failed} device nodes / xattrs / whiteouts not applied (needs privileges) — left as placeholder files"] }] }
+            - call: [log.info, "ufo: ${layers.len} layers → ${target}: ${app.files} files written, ${app.removed} removed"]
+            - return: [0]
+
+      - def:
+          name: cmd_list
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [prefix, string, "refs/layers/"]
+            - decl: [want, string, { call: [<.arg, pos] }]
+            - if: { condition: { gt: [want.len, 0] }, then: [{ set: [prefix, "refs/layers/${want}/"] }] }
+            - decl: [refs, list<ufo.repo.RefEntry>, { call: [<.repo.list_refs, prefix] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, refs.len] }
+                body:
+                  - decl: [ent, ufo.repo.RefEntry, { at: [refs, idx] }]
+                  - decl: [cmt, ufo.object.Commit, { call: [<.repo.read_commit, ent.oid] }]
+                  - decl: [run_id, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Run"] }]
+                  - print: ["${ent.oid} ${{ call: [ent.name.substr, 12] }} ${run_id}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [0]
+
+      - def:
+          name: cmd_log
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [name, string, { call: [<.arg, pos] }]
+            - decl: [oid, string, { call: [<.rev, name] }]
+            - if: { condition: { neq: [oid.len, 40] }, then: [{ return: [{ call: [<.fail, "unknown layer ${name}"] }] }] }
+            - decl: [shown, i32, 0]
+            - while:
+                condition: { and: [{ eq: [oid.len, 40] }, { lt: [shown, 100000] }] }
+                body:
+                  - decl: [cmt, ufo.object.Commit, { call: [<.repo.read_commit, oid] }]
+                  - if:
+                      condition: { eq: [cmt.valid, 0] }
+                      then: [{ set: [oid, ""] }]
+                      else:
+                        - decl: [run_id, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Run"] }]
+                        - decl: [step, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Step"] }]
+                        - print: ["${oid} tree ${cmt.tree} run ${run_id} ${step}"]
+                        - set: [shown, { +: [shown, 1] }]
+                        - if:
+                            condition: { eq: [cmt.parents.len, 0] }
+                            then: [{ set: [oid, ""] }]
+                            else: [{ set: [oid, { call: [cmt.parents.get, 0] }] }]
+            - return: [0]
+
+      - def:
+          name: cmd_show
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [name, string, { call: [<.arg, pos] }]
+            - decl: [oid, string, { call: [<.rev, name] }]
+            - if: { condition: { neq: [oid.len, 40] }, then: [{ return: [{ call: [<.fail, "unknown layer ${name}"] }] }] }
+            - decl: [cmt, ufo.object.Commit, { call: [<.repo.read_commit, oid] }]
+            - if: { condition: { eq: [cmt.valid, 0] }, then: [{ return: [{ call: [<.fail, "${name} is not a layer commit"] }] }] }
+            - print: ["layer    ${oid}"]
+            - print: ["tree     ${cmt.tree}"]
+            - if: { condition: { gt: [cmt.parents.len, 0] }, then: [{ print: ["previous ${{ call: [cmt.parents.get, 0] }}"] }] }
+            - decl: [tr_pipeline, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Pipeline"] }]
+            - print: ["pipeline ${tr_pipeline}"]
+            - decl: [tr_stage, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Stage"] }]
+            - print: ["stage    ${tr_stage}"]
+            - decl: [tr_run, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Run"] }]
+            - print: ["run      ${tr_run}"]
+            - decl: [tr_step, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Step"] }]
+            - print: ["step     ${tr_step}"]
+            - decl: [tr_agent, string, { call: [ufo.layer.trailer, cmt.message, "Ufo-Agent"] }]
+            - print: ["agent    ${tr_agent}"]
+            - decl: [binds, list<string>, { call: [ufo.layer.trailers, cmt.message, "Ufo-Binding"] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, binds.len] }
+                body:
+                  - print: ["binding  ${{ call: [binds.get, idx] }}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - decl: [bases, list<string>, { call: [ufo.layer.trailers, cmt.message, "Ufo-Base"] }]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, bases.len] }
+                body:
+                  - print: ["base     ${{ call: [bases.get, idx] }}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - decl: [dif, ptr<ufo.layerdiff.Differ>, { new: ufo.layerdiff.Differ }]
+            - decl: [lines, list<string>, { call: [dif.run, <.repo, "", cmt.tree] }]
+            - decl: [added, i32, 0]
+            - decl: [wouts, i32, 0]
+            - decl: [opqs, i32, 0]
+            - decl: [attrs, i32, 0]
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, lines.len] }
+                body:
+                  - decl: [line, string, { call: [lines.get, idx] }]
+                  - if: { condition: { eq: [{ call: [line.starts_with, "A "] }, 1] }, then: [{ set: [added, { +: [added, 1] }] }] }
+                  - if: { condition: { eq: [{ call: [line.starts_with, "W "] }, 1] }, then: [{ set: [wouts, { +: [wouts, 1] }] }] }
+                  - if: { condition: { eq: [{ call: [line.starts_with, "O "] }, 1] }, then: [{ set: [opqs, { +: [opqs, 1] }] }] }
+                  - if: { condition: { eq: [{ call: [line.starts_with, "+a "] }, 1] }, then: [{ set: [attrs, { +: [attrs, 1] }] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - print: ["content  ${added} paths, ${wouts} whiteouts, ${opqs} opaque dirs, ${attrs} attribute lines"]
+            - return: [0]
+
+      - def:
+          name: cmd_diff
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [old_name, string, { call: [<.arg, pos] }]
+            - decl: [new_name, string, { call: [<.arg, { +: [pos, 1] }] }]
+            - if: { condition: { eq: [new_name.len, 0] }, then: [{ return: [{ call: [<.fail, "usage: ufo layer diff <old> <new>"] }] }] }
+            - decl: [old_tree, string, ""]
+            - if:
+                condition: { neq: [old_name, "-"] }
+                then:
+                  - set: [old_tree, { call: [ufo.layer.tree_of, <.repo, { call: [<.rev, old_name] }] }]
+                  - if: { condition: { neq: [old_tree.len, 40] }, then: [{ return: [{ call: [<.fail, "unknown layer ${old_name}"] }] }] }
+            - decl: [new_tree, string, ""]
+            - if:
+                condition: { neq: [new_name, "-"] }
+                then:
+                  - set: [new_tree, { call: [ufo.layer.tree_of, <.repo, { call: [<.rev, new_name] }] }]
+                  - if: { condition: { neq: [new_tree.len, 40] }, then: [{ return: [{ call: [<.fail, "unknown layer ${new_name}"] }] }] }
+            - decl: [dif, ptr<ufo.layerdiff.Differ>, { new: ufo.layerdiff.Differ }]
+            - decl: [lines, list<string>, { call: [dif.run, <.repo, old_tree, new_tree] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, lines.len] }
+                body:
+                  - print: ["${{ call: [lines.get, idx] }}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [0]

@@ -1,0 +1,636 @@
+# ufo.layer — stage layers as git commits.
+#
+# A stage of a cosmos pipeline leaves an overlay *upper* directory: the files
+# it added or changed, char devices 0:0 for what it deleted, directories with
+# the xattr trusted.overlay.opaque=y that hide everything below them.  ufo
+# stores that as an ordinary git commit, so layers diff, fetch and push like
+# code — and dedupe: a stage that produced the same bytes gets the same tree.
+#
+# Layer tree (the OCI whiteout convention, readable by any git):
+#   <path>                 file / symlink / directory content, git modes
+#   <dir>/.wh.<name>       <name> was deleted by this layer (empty blob)
+#   <dir>/.wh..wh..opq     <dir> is opaque: the lower layers' content is gone
+#   <dir>/.ufo-keep        <dir> is empty (git has no empty directories)
+#   .ufo-attributes        what a git tree cannot hold, one line per path:
+#       <kind> <perm> <uid> <gid> <dev> <path>     kind f d l c b p s
+#       x <xattr-name> <hex value> <path>
+#     A line is written only where a path differs from the default (owner
+#     0:0, 0644 / 0755 by git mode, no xattrs).  Device nodes, fifos and
+#     sockets appear as an empty placeholder blob plus their line.  mtimes
+#     are not recorded: the same result must give the same tree.
+#
+# Commit: tree as above, parent = the previous run of the same stage
+# (refs/layers/<pipeline>/<stage>), message "layer <pipeline>/<stage> run <run>"
+# with trailers Ufo-Pipeline / Ufo-Stage / Ufo-Run / Ufo-Step / Ufo-Agent /
+# Ufo-Binding (k=v, repeated) / Ufo-Base (the layers this one sat on).
+
+- namespace: ufo.layer
+
+- import: "object.aiml"
+- import: "repo.aiml"
+
+- model:
+    name: Meta
+    fields:
+      - [pipeline, string, ""]
+      - [stage, string, ""]
+      - [run, string, ""]
+      - [step, string, ""]
+      - [agent, string, ""]
+      - [note, string, ""]
+      - [bindings, list<string>]
+      - [bases, list<string>]
+
+- def:
+    name: octal
+    args: [[value, i64], [width, i32]]
+    return: string
+    body:
+      - decl: [digits, string, "01234567"]
+      - decl: [out, string, ""]
+      - decl: [rest, i64, value]
+      - while:
+          condition: { or: [{ gt: [rest, 0] }, { lt: [out.len, width] }] }
+          body:
+            - decl: [dig, i64, { band: [rest, 7] }]
+            - set: [out, "${{ call: [digits.substr, dig, 1] }}${out}"]
+            - set: [rest, { shr: [rest, 3] }]
+      - return: [out]
+
+- def:
+    name: parse_octal
+    args: [[text, string]]
+    return: i64
+    body:
+      - decl: [out, i64, 0]
+      - decl: [idx, i32, 0]
+      - decl: [raw, buffer<u8>, { call: [bytes.from_string, text] }]
+      - while:
+          condition: { lt: [idx, raw.len] }
+          body:
+            - decl: [chr, i64, { call: [bytes.u8, raw, idx] }]
+            - set: [out, { +: [{ shl: [out, 3] }, { -: [chr, 48] }] }]
+            - set: [idx, { +: [idx, 1] }]
+      - return: [out]
+
+# A name usable as one ref path component chain (pipeline may contain "/").
+- def:
+    name: valid_part
+    args: [[text, string], [slash_ok, i32]]
+    return: i32
+    body:
+      - if: { condition: { eq: [text.len, 0] }, then: [{ return: [0] }] }
+      - if: { condition: { ge: [{ call: [text.index_of, ".."] }, 0] }, then: [{ return: [0] }] }
+      - if: { condition: { ge: [{ call: [text.index_of, " "] }, 0] }, then: [{ return: [0] }] }
+      - if: { condition: { ge: [{ call: [text.index_of, ":"] }, 0] }, then: [{ return: [0] }] }
+      - if: { condition: { ge: [{ call: [text.index_of, "~"] }, 0] }, then: [{ return: [0] }] }
+      - if: { condition: { ge: [{ call: [text.index_of, "^"] }, 0] }, then: [{ return: [0] }] }
+      - if: { condition: { eq: [{ call: [text.starts_with, "/"] }, 1] }, then: [{ return: [0] }] }
+      - if: { condition: { eq: [{ call: [text.ends_with, "/"] }, 1] }, then: [{ return: [0] }] }
+      - if: { condition: { and: [{ eq: [slash_ok, 0] }, { ge: [{ call: [text.index_of, "/"] }, 0] }] }, then: [{ return: [0] }] }
+      - return: [1]
+
+- def:
+    name: ref_name
+    args: [[pipeline, string], [stage, string]]
+    return: string
+    body:
+      - return: ["refs/layers/${pipeline}/${stage}"]
+
+# Value of trailer `key` in a commit message ("" when absent; the first one).
+- def:
+    name: trailer
+    static_off: ["str_cmp"]
+    args: [[message, string], [key, string]]
+    return: string
+    body:
+      - decl: [lines, list<string>, { call: [message.split, "\n"] }]
+      - decl: [want, string, "${key}: "]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, lines.len] }
+          body:
+            - decl: [line, string, { call: [lines.get, idx] }]
+            - if: { condition: { eq: [{ call: [line.starts_with, want] }, 1] }, then: [{ return: [{ call: [line.substr, want.len] }] }] }
+            - set: [idx, { +: [idx, 1] }]
+      - return: [""]
+
+# All values of trailer `key`.
+- def:
+    name: trailers
+    args: [[message, string], [key, string]]
+    return: list<string>
+    body:
+      - decl: [out, list<string>]
+      - decl: [lines, list<string>, { call: [message.split, "\n"] }]
+      - decl: [want, string, "${key}: "]
+      - decl: [idx, i32, 0]
+      - while:
+          condition: { lt: [idx, lines.len] }
+          body:
+            - decl: [line, string, { call: [lines.get, idx] }]
+            - if: { condition: { eq: [{ call: [line.starts_with, want] }, 1] }, then: [{ call: [out.push, { call: [line.substr, want.len] }] }] }
+            - set: [idx, { +: [idx, 1] }]
+      - return: [out]
+
+- def:
+    name: message
+    args: [[meta, ufo.layer.Meta]]
+    return: string
+    body:
+      - decl: [out, string, "layer ${meta.pipeline}/${meta.stage}"]
+      - if: { condition: { gt: [meta.run.len, 0] }, then: [{ set: [out, "${out} run ${meta.run}"] }] }
+      - set: [out, "${out}\n\n"]
+      - if: { condition: { gt: [meta.note.len, 0] }, then: [{ set: [out, "${out}${meta.note}\n\n"] }] }
+      - set: [out, "${out}Ufo-Pipeline: ${meta.pipeline}\nUfo-Stage: ${meta.stage}\n"]
+      - if: { condition: { gt: [meta.run.len, 0] }, then: [{ set: [out, "${out}Ufo-Run: ${meta.run}\n"] }] }
+      - if: { condition: { gt: [meta.step.len, 0] }, then: [{ set: [out, "${out}Ufo-Step: ${meta.step}\n"] }] }
+      - if: { condition: { gt: [meta.agent.len, 0] }, then: [{ set: [out, "${out}Ufo-Agent: ${meta.agent}\n"] }] }
+      - decl: [bdx, i32, 0]
+      - while:
+          condition: { lt: [bdx, meta.bindings.len] }
+          body:
+            - set: [out, "${out}Ufo-Binding: ${{ call: [meta.bindings.get, bdx] }}\n"]
+            - set: [bdx, { +: [bdx, 1] }]
+      - decl: [sdx, i32, 0]
+      - while:
+          condition: { lt: [sdx, meta.bases.len] }
+          body:
+            - set: [out, "${out}Ufo-Base: ${{ call: [meta.bases.get, sdx] }}\n"]
+            - set: [sdx, { +: [sdx, 1] }]
+      - return: [out]
+
+# ── upper directory → tree ───────────────────────────────────────────────────
+- class:
+    name: Scanner
+    members:
+      - [attrs, list<string>, null, { access: public }]
+      - [uid_shift, i64, 0, { access: public }]
+      - [files, i64, 0, { access: public }]
+      - [whiteouts, i64, 0, { access: public }]
+      - [opaques, i64, 0, { access: public }]
+      - [specials, i64, 0, { access: public }]
+      - [empty_id, string, ""]
+    methods:
+      - def:
+          name: empty_blob
+          args: [[repo, ref<ufo.repo.Repository>]]
+          return: string
+          body:
+            - if: { condition: { eq: [<.empty_id.len, 0] }, then: [{ set: [<.empty_id, { call: [repo.write_object, "blob", { call: [bytes.from_string, ""] }] }] }] }
+            - return: [<.empty_id]
+
+      - def:
+          name: owner
+          args: [[ident, i64]]
+          return: i64
+          body:
+            - if: { condition: { and: [{ gt: [<.uid_shift, 0] }, { ge: [ident, <.uid_shift] }] }, then: [{ return: [{ -: [ident, <.uid_shift] }] }] }
+            - return: [ident]
+
+      - def:
+          name: is_opaque
+          static_off: ["str_cmp"]
+          args: [[full, string]]
+          return: i32
+          body:
+            - decl: [one, buffer<u8>, { call: [fsmeta.xattr_get, full, "trusted.overlay.opaque"] }]
+            - if: { condition: { eq: [{ call: [bytes.text, one] }, "y"] }, then: [{ return: [1] }] }
+            - decl: [two, buffer<u8>, { call: [fsmeta.xattr_get, full, "user.overlay.opaque"] }]
+            - if: { condition: { eq: [{ call: [bytes.text, two] }, "y"] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      # Attribute lines for one path: owner/perm/device where not default, xattrs.
+      - def:
+          name: record
+          static_off: ["str_cmp"]
+          args: [[full, string], [rel, string], [kind, string], [dflt, i64]]
+          body:
+            - decl: [mode, i64, { call: [fsmeta.stat, full, 0] }]
+            - decl: [perm, i64, { band: [mode, 4095] }]
+            - decl: [uid, i64, { call: [<.owner, { call: [fsmeta.stat, full, 1] }] }]
+            - decl: [gid, i64, { call: [<.owner, { call: [fsmeta.stat, full, 2] }] }]
+            - decl: [dev, string, "-"]
+            - if:
+                condition: { or: [{ eq: [kind, "c"] }, { eq: [kind, "b"] }] }
+                then: [{ set: [dev, "${{ call: [fsmeta.stat, full, 3] }}:${{ call: [fsmeta.stat, full, 4] }}"] }]
+            - decl: [special, i32, 0]
+            - if: { condition: { or: [{ or: [{ eq: [kind, "c"] }, { eq: [kind, "b"] }] }, { or: [{ eq: [kind, "p"] }, { eq: [kind, "s"] }] }] }, then: [{ set: [special, 1] }] }
+            # symlink permissions mean nothing on Linux
+            - if: { condition: { eq: [kind, "l"] }, then: [{ set: [perm, 511] }, { set: [dflt, 511] }] }
+            - if:
+                condition: { or: [{ or: [{ eq: [special, 1] }, { neq: [perm, dflt] }] }, { or: [{ neq: [uid, 0] }, { neq: [gid, 0] }] }] }
+                then:
+                  - call: [<.attrs.push, "${kind} ${{ call: [ufo.layer.octal, perm, 4] }} ${uid} ${gid} ${dev} ${rel}"]
+            - decl: [names_txt, string, { call: [fsmeta.xattrs, full] }]
+            - if:
+                condition: { gt: [names_txt.len, 0] }
+                then:
+                  - decl: [names, list<string>, { call: [names_txt.split, "\n"] }]
+                  - decl: [ndx, i32, 0]
+                  - while:
+                      condition: { lt: [ndx, names.len] }
+                      body:
+                        - decl: [xname, string, { call: [names.get, ndx] }]
+                        - set: [ndx, { +: [ndx, 1] }]
+                        - decl: [skip, i32, 0]
+                        - if: { condition: { eq: [{ call: [xname.starts_with, "trusted.overlay."] }, 1] }, then: [{ set: [skip, 1] }] }
+                        - if: { condition: { eq: [{ call: [xname.starts_with, "user.overlay."] }, 1] }, then: [{ set: [skip, 1] }] }
+                        - if: { condition: { eq: [xname.len, 0] }, then: [{ set: [skip, 1] }] }
+                        - if:
+                            condition: { eq: [skip, 0] }
+                            then:
+                              - decl: [value, buffer<u8>, { call: [fsmeta.xattr_get, full, xname] }]
+                              - call: [<.attrs.push, "x ${xname} ${{ call: [bytes.to_hex, value] }} ${rel}"]
+
+      # Tree entries of directory `dir` (relative path `rel`, "" at the top).
+      - def:
+          name: entries_of
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [dir, string], [rel, string]]
+          return: list<ufo.object.TreeEntry>
+          body:
+            - decl: [entries, list<ufo.object.TreeEntry>]
+            - if:
+                condition: { eq: [{ call: [<.is_opaque, dir] }, 1] }
+                then:
+                  - decl: [opq, ufo.object.TreeEntry]
+                  - set: [opq.mode, "100644"]
+                  - set: [opq.name, ".wh..wh..opq"]
+                  - set: [opq.oid, { call: [<.empty_blob, repo] }]
+                  - call: [entries.push, opq]
+                  - set: [<.opaques, { +: [<.opaques, 1] }]
+            - decl: [listing, list<path>, { call: [io.list_dir, dir] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, listing.len] }
+                body:
+                  - decl: [item, path, { call: [listing.get, idx] }]
+                  - decl: [name, string, { call: [item.name] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [full, string, "${dir}/${name}"]
+                  - decl: [relp, string, name]
+                  - if: { condition: { gt: [rel.len, 0] }, then: [{ set: [relp, "${rel}/${name}"] }] }
+                  - decl: [mode, i64, { call: [fsmeta.stat, full, 0] }]
+                  - decl: [ftype, i64, { band: [mode, 61440] }]
+                  - decl: [ent, ufo.object.TreeEntry]
+                  - set: [ent.name, name]
+                  - if:
+                      condition: { and: [{ eq: [rel.len, 0] }, { eq: [name, ".ufo-attributes"] }] }
+                      then:
+                        - call: [log.warn, "ufo: ${full}: .ufo-attributes is reserved — skipped"]
+                        - set: [mode, -1]
+                  # 0020000 char device: 0:0 is an overlay whiteout
+                  - if:
+                      condition: { and: [{ eq: [ftype, 8192] }, { and: [{ eq: [{ call: [fsmeta.stat, full, 3] }, 0] }, { eq: [{ call: [fsmeta.stat, full, 4] }, 0] }] }] }
+                      then:
+                        - set: [ent.name, ".wh.${name}"]
+                        - set: [ent.mode, "100644"]
+                        - set: [ent.oid, { call: [<.empty_blob, repo] }]
+                        - set: [<.whiteouts, { +: [<.whiteouts, 1] }]
+                        - set: [mode, -1]
+                  - if:
+                      condition: { lt: [mode, 0] }
+                      then: []
+                      else:
+                        - if:
+                            condition: { eq: [ftype, 40960] }
+                            then:
+                              - set: [ent.mode, "120000"]
+                              - set: [ent.oid, { call: [repo.write_object, "blob", { call: [bytes.from_string, { call: [io.read_link, full] }] }] }]
+                              - call: [<.record, full, relp, "l", 511]
+                              - set: [<.files, { +: [<.files, 1] }]
+                        - if:
+                            condition: { eq: [ftype, 16384] }
+                            then:
+                              - set: [ent.mode, "40000"]
+                              - set: [ent.oid, { call: [<.tree_of, repo, full, relp] }]
+                              - call: [<.record, full, relp, "d", 493]
+                        - if:
+                            condition: { eq: [ftype, 32768] }
+                            then:
+                              - set: [ent.mode, "100644"]
+                              - decl: [dflt, i64, 420]
+                              - if: { condition: { neq: [{ band: [mode, 64] }, 0] }, then: [{ set: [ent.mode, "100755"] }, { set: [dflt, 493] }] }
+                              - set: [ent.oid, { call: [repo.write_object, "blob", { call: [bytes.read_file, full] }] }]
+                              - call: [<.record, full, relp, "f", dflt]
+                              - set: [<.files, { +: [<.files, 1] }]
+                        - decl: [kind, string, ""]
+                        - if: { condition: { eq: [ftype, 8192] }, then: [{ set: [kind, "c"] }] }
+                        - if: { condition: { eq: [ftype, 24576] }, then: [{ set: [kind, "b"] }] }
+                        - if: { condition: { eq: [ftype, 4096] }, then: [{ set: [kind, "p"] }] }
+                        - if: { condition: { eq: [ftype, 49152] }, then: [{ set: [kind, "s"] }] }
+                        - if:
+                            condition: { gt: [kind.len, 0] }
+                            then:
+                              - set: [ent.mode, "100644"]
+                              - set: [ent.oid, { call: [<.empty_blob, repo] }]
+                              - call: [<.record, full, relp, kind, 420]
+                              - set: [<.specials, { +: [<.specials, 1] }]
+                  - if: { condition: { gt: [ent.oid.len, 0] }, then: [{ call: [entries.push, ent] }] }
+            - if:
+                condition: { and: [{ eq: [entries.len, 0] }, { gt: [rel.len, 0] }] }
+                then:
+                  - decl: [keep, ufo.object.TreeEntry]
+                  - set: [keep.name, ".ufo-keep"]
+                  - set: [keep.mode, "100644"]
+                  - set: [keep.oid, { call: [<.empty_blob, repo] }]
+                  - call: [entries.push, keep]
+            - return: [entries]
+
+      - def:
+          name: tree_of
+          args: [[repo, ref<ufo.repo.Repository>], [dir, string], [rel, string]]
+          return: string
+          body:
+            - decl: [entries, list<ufo.object.TreeEntry>, { call: [<.entries_of, repo, dir, rel] }]
+            - return: [{ call: [repo.write_object, "tree", { call: [ufo.object.tree_encode, entries] }] }]
+
+      # The layer tree of an upper directory.
+      - def:
+          name: scan
+          args: [[repo, ref<ufo.repo.Repository>], [dir, string]]
+          return: string
+          body:
+            - decl: [entries, list<ufo.object.TreeEntry>, { call: [<.entries_of, repo, dir, ""] }]
+            - if:
+                condition: { gt: [<.attrs.len, 0] }
+                then:
+                  - call: [<.attrs.sort]
+                  - decl: [text, string, ""]
+                  - decl: [adx, i32, 0]
+                  - while:
+                      condition: { lt: [adx, <.attrs.len] }
+                      body:
+                        - set: [text, "${text}${{ call: [<.attrs.get, adx] }}\n"]
+                        - set: [adx, { +: [adx, 1] }]
+                  - decl: [ent, ufo.object.TreeEntry]
+                  - set: [ent.name, ".ufo-attributes"]
+                  - set: [ent.mode, "100644"]
+                  - set: [ent.oid, { call: [repo.write_object, "blob", { call: [bytes.from_string, text] }] }]
+                  - call: [entries.push, ent]
+            - return: [{ call: [repo.write_object, "tree", { call: [ufo.object.tree_encode, entries] }] }]
+
+# Writes the layer commit for `tree`; parent = the stage ref's current commit.
+# Moves the ref unless `move_ref` is 0.  Returns the commit id.
+- def:
+    name: commit
+    args: [[repo, ref<ufo.repo.Repository>], [tree, string], [meta, ufo.layer.Meta], [author, string], [move_ref, i32]]
+    return: string
+    body:
+      - decl: [refname, string, { call: [ufo.layer.ref_name, meta.pipeline, meta.stage] }]
+      - decl: [cmt, ufo.object.Commit]
+      - set: [cmt.tree, tree]
+      - decl: [prev, string, { call: [repo.resolve, refname] }]
+      - if: { condition: { eq: [prev.len, 40] }, then: [{ call: [cmt.parents.push, prev] }] }
+      - set: [cmt.author, author]
+      - set: [cmt.committer, author]
+      - set: [cmt.message, { call: [ufo.layer.message, meta] }]
+      - decl: [made, string, { call: [repo.write_object, "commit", { call: [ufo.object.commit_encode, cmt] }] }]
+      - if: { condition: { neq: [move_ref, 0] }, then: [{ call: [repo.update_ref, refname, made] }] }
+      - return: [made]
+
+# The tree a layer revision stands for (commit → its tree; a tree as it is).
+- def:
+    name: tree_of
+    static_off: ["str_cmp"]
+    args: [[repo, ref<ufo.repo.Repository>], [oid, string]]
+    return: string
+    body:
+      - if: { condition: { neq: [oid.len, 40] }, then: [{ return: [""] }] }
+      - decl: [kind, string, { call: [repo.kind, oid] }]
+      - if: { condition: { eq: [kind, "tree"] }, then: [{ return: [oid] }] }
+      - if:
+          condition: { eq: [kind, "commit"] }
+          then:
+            - decl: [cmt, ufo.object.Commit, { call: [repo.read_commit, oid] }]
+            - return: [cmt.tree]
+      - return: [""]
+
+# ── tree → directory ─────────────────────────────────────────────────────────
+#   mode 0  rootfs: stack onto `dir` — whiteouts delete, opaque dirs clear
+#   mode 1  upper:  overlay form — char 0:0 whiteouts, trusted.overlay.opaque
+#                   (marker files stay where the kernel refuses that)
+#   mode 2  oci:    .wh. files as they are (tar it: an OCI layer)
+- class:
+    name: Applier
+    members:
+      - [mode, i32, 0, { access: public }]
+      - [files, i64, 0, { access: public }]
+      - [removed, i64, 0, { access: public }]
+      - [failed, i64, 0, { access: public }]
+      - [owner_failed, i64, 0, { access: public }]
+    methods:
+      - def:
+          name: present
+          args: [[full, string]]
+          return: i32
+          body:
+            - if: { condition: { ge: [{ call: [fsmeta.stat, full, 0] }, 0] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      - def:
+          name: is_real_dir
+          args: [[full, string]]
+          return: i32
+          body:
+            - decl: [mode, i64, { call: [fsmeta.stat, full, 0] }]
+            - if: { condition: { lt: [mode, 0] }, then: [{ return: [0] }] }
+            - if: { condition: { eq: [{ band: [mode, 61440] }, 16384] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      - def:
+          name: clear
+          args: [[full, string]]
+          body:
+            - if:
+                condition: { eq: [{ call: [<.present, full] }, 1] }
+                then:
+                  - if:
+                      condition: { eq: [{ call: [<.is_real_dir, full] }, 1] }
+                      then: [{ call: [io.remove_all, full] }]
+                      else: [{ call: [io.remove, full] }]
+                  - set: [<.removed, { +: [<.removed, 1] }]
+
+      - def:
+          name: put_empty
+          args: [[full, string]]
+          body:
+            - call: [io.write_file, full, ""]
+
+      - def:
+          name: apply_dir
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [tree, string], [dir, string], [top, i32]]
+          return: i32
+          body:
+            - if:
+                condition: { eq: [{ call: [<.is_real_dir, dir] }, 0] }
+                then:
+                  - call: [<.clear, dir]
+                  - call: [io.mkdir_all, dir]
+            - decl: [raw, buffer<u8>, { call: [repo.read_raw, tree] }]
+            - if: { condition: { neq: [{ call: [ufo.object.kind_of, raw] }, "tree"] }, then: [{ return: [-1] }] }
+            - decl: [entries, list<ufo.object.TreeEntry>, { call: [ufo.object.tree_decode, { call: [ufo.object.body_of, raw] }] }]
+            # deletions first: they refer to the lower layers, not to this one
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, entries.len] }
+                body:
+                  - decl: [ent, ufo.object.TreeEntry, { at: [entries, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if:
+                      condition: { eq: [ent.name, ".wh..wh..opq"] }
+                      then:
+                        - if:
+                            condition: { eq: [<.mode, 0] }
+                            then:
+                              - call: [io.remove_all, dir]
+                              - call: [io.mkdir_all, dir]
+                              - set: [<.removed, { +: [<.removed, 1] }]
+                        - if:
+                            condition: { eq: [<.mode, 1] }
+                            then:
+                              - decl: [yes, buffer<u8>, { call: [bytes.from_string, "y"] }]
+                              - decl: [okay, i32, { call: [fsmeta.xattr_set, dir, "trusted.overlay.opaque", yes] }]
+                              - if: { condition: { neq: [okay, 0] }, then: [{ set: [okay, { call: [fsmeta.xattr_set, dir, "user.overlay.opaque", yes] }] }] }
+                              - if: { condition: { neq: [okay, 0] }, then: [{ call: [<.put_empty, "${dir}/.wh..wh..opq"] }, { set: [<.failed, { +: [<.failed, 1] }] }] }
+                        - if: { condition: { eq: [<.mode, 2] }, then: [{ call: [<.put_empty, "${dir}/.wh..wh..opq"] }] }
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, entries.len] }
+                body:
+                  - decl: [ent, ufo.object.TreeEntry, { at: [entries, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if:
+                      condition: { and: [{ eq: [{ call: [ent.name.starts_with, ".wh."] }, 1] }, { neq: [ent.name, ".wh..wh..opq"] }] }
+                      then:
+                        - decl: [victim, string, "${dir}/${{ call: [ent.name.substr, 4] }}"]
+                        - if: { condition: { eq: [<.mode, 0] }, then: [{ call: [<.clear, victim] }] }
+                        - if:
+                            condition: { eq: [<.mode, 1] }
+                            then:
+                              - call: [<.clear, victim]
+                              - if:
+                                  condition: { neq: [{ call: [fsmeta.mknod, victim, 8192, 0, 0] }, 0] }
+                                  then: [{ call: [<.put_empty, "${dir}/${ent.name}"] }, { set: [<.failed, { +: [<.failed, 1] }] }]
+                        - if: { condition: { eq: [<.mode, 2] }, then: [{ call: [<.put_empty, "${dir}/${ent.name}"] }] }
+            # content
+            - set: [idx, 0]
+            - while:
+                condition: { lt: [idx, entries.len] }
+                body:
+                  - decl: [ent, ufo.object.TreeEntry, { at: [entries, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [skip, i32, 0]
+                  - if: { condition: { eq: [{ call: [ent.name.starts_with, ".wh."] }, 1] }, then: [{ set: [skip, 1] }] }
+                  - if: { condition: { eq: [ent.name, ".ufo-keep"] }, then: [{ set: [skip, 1] }] }
+                  - if: { condition: { eq: [ent.mode, "160000"] }, then: [{ set: [skip, 1] }] }
+                  - if: { condition: { and: [{ eq: [top, 1] }, { eq: [ent.name, ".ufo-attributes"] }] }, then: [{ set: [skip, 1] }] }
+                  - if:
+                      condition: { eq: [skip, 0] }
+                      then:
+                        - decl: [full, string, "${dir}/${ent.name}"]
+                        - if:
+                            condition: { eq: [ent.mode, "40000"] }
+                            then:
+                              - if: { condition: { lt: [{ call: [<.apply_dir, repo, ent.oid, full, 0] }, 0] }, then: [{ return: [-1] }] }
+                            else:
+                              - call: [<.clear, full]
+                              - decl: [body, buffer<u8>, { call: [repo.read_body, ent.oid] }]
+                              - if:
+                                  condition: { eq: [ent.mode, "120000"] }
+                                  then:
+                                    - call: [io.symlink, { call: [bytes.text, body] }, full]
+                                  else:
+                                    - call: [io.write_file, full, body]
+                                    - if:
+                                        condition: { eq: [ent.mode, "100755"] }
+                                        then: [{ call: [fsmeta.chmod, full, 493] }]
+                                        else: [{ call: [fsmeta.chmod, full, 420] }]
+                              - set: [<.files, { +: [<.files, 1] }]
+            - return: [0]
+
+      # Applies the .ufo-attributes lines below `dir`.
+      - def:
+          name: apply_attrs
+          static_off: ["str_cmp"]
+          args: [[text, string], [dir, string]]
+          body:
+            - decl: [lines, list<string>, { call: [text.split, "\n"] }]
+            - decl: [ldx, i32, 0]
+            - while:
+                condition: { lt: [ldx, lines.len] }
+                body:
+                  - decl: [line, string, { call: [lines.get, ldx] }]
+                  - set: [ldx, { +: [ldx, 1] }]
+                  - if:
+                      condition: { eq: [{ call: [line.starts_with, "x "] }, 1] }
+                      then:
+                        - decl: [rest, string, { call: [line.substr, 2] }]
+                        - decl: [cut, i32, { call: [rest.index_of, " "] }]
+                        - decl: [xname, string, { call: [rest.substr, 0, cut] }]
+                        - set: [rest, { call: [rest.substr, { +: [cut, 1] }] }]
+                        - set: [cut, { call: [rest.index_of, " "] }]
+                        - decl: [hexv, string, { call: [rest.substr, 0, cut] }]
+                        - decl: [target, string, "${dir}/${{ call: [rest.substr, { +: [cut, 1] }] }}"]
+                        - if: { condition: { neq: [{ call: [fsmeta.xattr_set, target, xname, { call: [bytes.from_hex, hexv] }] }, 0] }, then: [{ set: [<.failed, { +: [<.failed, 1] }] }] }
+                      else:
+                        - if:
+                            condition: { gt: [line.len, 2] }
+                            then:
+                              - decl: [parts, list<string>, { call: [line.split, " "] }]
+                              - decl: [kind, string, { call: [parts.get, 0] }]
+                              - decl: [perm_txt, string, { call: [parts.get, 1] }]
+                              - decl: [perm, i64, { call: [ufo.layer.parse_octal, perm_txt] }]
+                              - decl: [uid_txt, string, { call: [parts.get, 2] }]
+                              - decl: [gid_txt, string, { call: [parts.get, 3] }]
+                              - decl: [dev, string, { call: [parts.get, 4] }]
+                              # the path is everything after the fifth space
+                              - decl: [skip_len, i32, { +: [{ +: [kind.len, perm_txt.len] }, { +: [{ +: [uid_txt.len, gid_txt.len] }, { +: [dev.len, 5] }] }] }]
+                              - decl: [target, string, "${dir}/${{ call: [line.substr, skip_len] }}"]
+                              - decl: [ftype, i64, 0]
+                              - if: { condition: { eq: [kind, "c"] }, then: [{ set: [ftype, 8192] }] }
+                              - if: { condition: { eq: [kind, "b"] }, then: [{ set: [ftype, 24576] }] }
+                              - if: { condition: { eq: [kind, "p"] }, then: [{ set: [ftype, 4096] }] }
+                              - if: { condition: { eq: [kind, "s"] }, then: [{ set: [ftype, 49152] }] }
+                              - if:
+                                  condition: { gt: [ftype, 0] }
+                                  then:
+                                    - decl: [maj, i64, 0]
+                                    - decl: [mnr, i64, 0]
+                                    - decl: [colon, i32, { call: [dev.index_of, ":"] }]
+                                    - if:
+                                        condition: { gt: [colon, 0] }
+                                        then:
+                                          - decl: [maj_txt, string, { call: [dev.substr, 0, colon] }]
+                                          - decl: [mnr_txt, string, { call: [dev.substr, { +: [colon, 1] }] }]
+                                          - set: [maj, { call: [maj_txt.to_int] }]
+                                          - set: [mnr, { call: [mnr_txt.to_int] }]
+                                    - call: [<.clear, target]
+                                    - if: { condition: { neq: [{ call: [fsmeta.mknod, target, { bor: [ftype, perm] }, maj, mnr] }, 0] }, then: [{ call: [<.put_empty, target] }, { set: [<.failed, { +: [<.failed, 1] }] }] }
+                              - if: { condition: { neq: [kind, "l"] }, then: [{ call: [fsmeta.chmod, target, perm] }] }
+                              - if: { condition: { neq: [{ call: [fsmeta.chown, target, { call: [uid_txt.to_int] }, { call: [gid_txt.to_int] }] }, 0] }, then: [{ set: [<.owner_failed, { +: [<.owner_failed, 1] }] }] }
+                              - if: { condition: { neq: [kind, "l"] }, then: [{ call: [fsmeta.chmod, target, perm] }] }
+
+      # One layer (commit or tree) onto `dir`.
+      - def:
+          name: apply
+          args: [[repo, ref<ufo.repo.Repository>], [oid, string], [dir, string]]
+          return: i32
+          body:
+            - decl: [tree, string, { call: [ufo.layer.tree_of, repo, oid] }]
+            - if: { condition: { eq: [tree.len, 0] }, then: [{ return: [-1] }] }
+            - if: { condition: { lt: [{ call: [<.apply_dir, repo, tree, dir, 1] }, 0] }, then: [{ return: [-1] }] }
+            - decl: [attr_id, string, { call: [repo.at_path, tree, ".ufo-attributes"] }]
+            - if:
+                condition: { eq: [attr_id.len, 40] }
+                then:
+                  - decl: [text, string, { call: [bytes.text, { call: [repo.read_body, attr_id] }] }]
+                  - if:
+                      condition: { eq: [<.mode, 2] }
+                      then:
+                        - call: [io.write_file, "${dir}/.ufo-attributes", text]
+                      else:
+                        - call: [<.apply_attrs, text, dir]
+            - return: [0]
