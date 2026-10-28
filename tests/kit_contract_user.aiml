@@ -1,0 +1,21 @@
+# The user module of tests/test_kit_contract.aiml: it imports only the contract.
+- namespace: ufo.kit
+
+- import: "../lib/kit/api.aiml"
+
+- class:
+    name: KitUser
+    methods:
+      # export → push → pull → "same" when the pulled image has the exported digest.
+      - def:
+          name: roundtrip
+          static_off: ["str_cmp"]
+          args: [[kit, ref<ufo.kit.LayerKit>], [layers, string], [img, string], [back, string], [reference, string]]
+          return: string
+          body:
+            - if: { condition: { neq: [{ call: [kit.images.export_layers, layers, img, "demo", "amd64"] }, 0] }, then: [{ return: "export failed" }] }
+            - decl: [pushed, string, { call: [kit.registry.push, img, reference, ""] }]
+            - if: { condition: { eq: [pushed.len, 0] }, then: [{ return: "push failed" }] }
+            - decl: [pulled, string, { call: [kit.registry.pull, reference, back] }]
+            - if: { condition: { neq: [pulled, pushed] }, then: [{ return: "pulled ${pulled} pushed ${pushed}" }] }
+            - return: "same"
