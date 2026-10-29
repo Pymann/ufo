@@ -1,6 +1,6 @@
 # ufo.kit — the layer kit contract (doc/kit.md §1, aiml spec/58 §12).
 # Users import this file only; a composition root imports an implementation
-# (lib/kit/museum.aiml or lib/kit/layout.aiml).
+# (lib/kit/kontor.aiml or lib/kit/layout.aiml).
 - namespace: ufo.kit
 
 - import: "contracts.aiml"

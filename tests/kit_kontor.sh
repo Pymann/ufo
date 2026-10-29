@@ -1,11 +1,11 @@
 #!/bin/bash
-# ufo.kit MuseumKit against a live museum (doc/kit.md §6).
-#   AIML_BIN=/path/to/aiml MUSEUM_DIR=../museum UFO=./ufo tests/kit_museum.sh
+# ufo.kit KontorKit against a live kontor (doc/kit.md §6).
+#   AIML_BIN=/path/to/aiml KONTOR_DIR=../kontor UFO=./ufo tests/kit_kontor.sh
 set -u
 cd "$(dirname "$0")/.."
 UFO="${UFO:-./ufo}"
 AIML_BIN="${AIML_BIN:-aiml}"
-MUSEUM_DIR="${MUSEUM_DIR:-../museum}"
+KONTOR_DIR="${KONTOR_DIR:-../kontor}"
 PORT="${PORT:-18341}"
 WORK="$(mktemp -d)"; PIDS=""
 trap 'kill $PIDS 2>/dev/null; rm -rf "$WORK"' EXIT
@@ -14,13 +14,13 @@ pass() { PASSES=$((PASSES + 1)); echo "  ok   $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  FAIL $1"; }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: got '$2' want '$3'"; fi; }
 json() { python3 -c "import json,sys; j=json.load(open(sys.argv[1])); print($2)" "$1"; }
-[ -f "$MUSEUM_DIR/museum.aiml" ] || { echo "SKIP: no museum at $MUSEUM_DIR"; exit 0; }
+[ -f "$KONTOR_DIR/kontor.aiml" ] || { echo "SKIP: no kontor at $KONTOR_DIR"; exit 0; }
 TOKEN=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1)
 mkdir -p "$WORK/data"
 # a server already on the port would be tested instead of ours
 if curl -s -o /dev/null "http://127.0.0.1:$PORT/"; then echo "FAIL port $PORT is in use"; exit 1; fi
-# exec: $! is museum itself, so the trap stops it (not just the subshell)
-(cd "$MUSEUM_DIR" && MUSEUM_ADMIN_TOKEN="$TOKEN" AIML_MEM_V3=1 exec "$AIML_BIN" museum.aiml -- "$PORT" "$WORK/data" > "$WORK/museum.log" 2>&1) & PIDS="$!"
+# exec: $! is kontor itself, so the trap stops it (not just the subshell)
+(cd "$KONTOR_DIR" && KONTOR_ADMIN_TOKEN="$TOKEN" AIML_MEM_V3=1 exec "$AIML_BIN" kontor.aiml -- "$PORT" "$WORK/data" > "$WORK/kontor.log" 2>&1) & PIDS="$!"
 for _ in $(seq 150); do curl -s -o /dev/null "http://127.0.0.1:$PORT/api/health" && break; sleep 0.2; done
 URL="http://127.0.0.1:$PORT"
 
@@ -38,7 +38,7 @@ export UFO_REGISTRY_TOKEN="$TOKEN"
 D1=$($UFO image push "$WORK/img" cosmos-layers/demo:run-7 --registry "$URL" --artifact-type application/vnd.cosmos.run-layers.v1+json 2> "$WORK/push.err")
 check "push prints a sha256 digest" "$(echo "$D1" | grep -cE '^sha256:[0-9a-f]{64}$')" "1"
 curl -s -H "Authorization: Bearer $TOKEN" "$URL/api/v1/layers/demo/run-7" > "$WORK/run.json"
-check "museum lists the run's stages" "$(json "$WORK/run.json" "[s['stage'] for s in j['stages']]")" "['base', 'build']"
+check "kontor lists the run's stages" "$(json "$WORK/run.json" "[s['stage'] for s in j['stages']]")" "['base', 'build']"
 check "with their bindings and agent" "$(json "$WORK/run.json" "j['stages'][1]['bindings'] + ' ' + j['stages'][1]['agent']")" "arch=amd64 a1"
 D2=$($UFO image pull cosmos-layers/demo:run-7 "$WORK/back" --registry "$URL" 2>/dev/null)
 check "pull: same manifest digest" "$D2" "$D1"

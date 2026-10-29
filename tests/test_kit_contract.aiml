@@ -1,12 +1,12 @@
 # doc/kit.md §6 — user code names ONLY the contract (ufo.kit.LayerKit, aiml
 # spec/58 §12); the composition root (main) picks the kit.  The same `roundtrip`
-# drives a LayoutKit (works offline) and a MuseumKit pointed at a port nobody
+# drives a LayoutKit (works offline) and a KontorKit pointed at a port nobody
 # listens on (push/pull answer "" — no crash, no hang).
 #   AIML_MEM_V3=1 aiml tests/test_kit_contract.aiml      (from the ufo root)
 # Expected exit code: 0
 
 - import: "lib/kit/layout.aiml"
-- import: "lib/kit/museum.aiml"
+- import: "lib/kit/kontor.aiml"
 - import: "tests/kit_contract_user.aiml"
 
 - def:
@@ -25,9 +25,9 @@
       - decl: [got, string, { call: [user.roundtrip, local, "${base}/layers", "${base}/img", "${base}/back", "demo/app:v1"] }]
       - if: { condition: { neq: [got, "same"] }, then: [{ print: ["FAIL LayoutKit roundtrip: ${got}"] }, { set: [fails, { +: [fails, 1] }] }] }
 
-      - decl: [remote, ptr<ufo.kit.LayerKit>, { new: ufo.kit.MuseumKit, url: "http://127.0.0.1:9", token: "", git_dir: "", work_dir: "${base}/work2" }]
+      - decl: [remote, ptr<ufo.kit.LayerKit>, { new: ufo.kit.KontorKit, url: "http://127.0.0.1:9", token: "", git_dir: "", work_dir: "${base}/work2" }]
       - decl: [miss, string, { call: [user.roundtrip, remote, "${base}/layers", "${base}/img2", "${base}/back2", "demo/app:v1"] }]
-      - if: { condition: { neq: [miss, "push failed"] }, then: [{ print: ["FAIL MuseumKit without a registry: ${miss}"] }, { set: [fails, { +: [fails, 1] }] }] }
+      - if: { condition: { neq: [miss, "push failed"] }, then: [{ print: ["FAIL KontorKit without a registry: ${miss}"] }, { set: [fails, { +: [fails, 1] }] }] }
 
       - call: [io.remove_all, base]
       - if: { condition: { gt: [fails, 0] }, then: [{ return: 1 }] }

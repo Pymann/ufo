@@ -130,11 +130,11 @@ Exports are reproducible (sorted pax tar, fixed timestamps in config and gzip):
 the same upper directory always gives the same digest. Whiteouts, opaque
 directories, owners, modes, device nodes, fifos, hard links, symlinks and
 xattrs survive export and import. `--registry` talks to an OCI distribution
-registry such as museum (`UFO_REGISTRY_TOKEN` = Bearer token, never on the
+registry such as kontor (`UFO_REGISTRY_TOKEN` = Bearer token, never on the
 command line, never logged); `--root` uses a directory of layouts instead.
 
 In aiml code the kit is one contract, `ufo.kit.LayerKit` (lib/kit/api.aiml),
-with two implementations, `ufo.kit.MuseumKit` and `ufo.kit.LayoutKit`.
+with two implementations, `ufo.kit.KontorKit` and `ufo.kit.LayoutKit`.
 
 ## Building
 
@@ -158,22 +158,22 @@ UFO=./ufo tests/interop.sh   # object store / packs against git (18 checks)
 UFO=./ufo tests/remote.sh    # smart HTTP against git http-backend (26 checks)
 UFO=./ufo tests/layer.sh     # layers against a real overlayfs mount (33 checks; root)
 AIML_MEM_V3=1 aiml tests/test_object.aiml
-AIML_BIN=aiml MUSEUM_DIR=../museum tests/package.sh   # package → museum → download → run
+AIML_BIN=aiml KONTOR_DIR=../kontor tests/package.sh   # package → kontor → download → run
 UFO=./ufo tests/kit.sh       # images: export/import/registry/history (39 checks with cosmos; root)
-AIML_BIN=aiml MUSEUM_DIR=../museum UFO=./ufo tests/kit_museum.sh   # MuseumKit against a live museum
+AIML_BIN=aiml KONTOR_DIR=../kontor UFO=./ufo tests/kit_kontor.sh   # KontorKit against a live kontor
 AIML_MEM_V3=1 aiml tests/test_kit_contract.aiml                    # one user, two kits
 ```
 `tests/kit.sh` part B runs when `COSMOS_RT_OCI` (cosmos' `cosmos-oci`) and
 `COSMOS_BASE` are set.
 
-## Distribution through museum
+## Distribution through kontor
 
 `scripts/package.sh` writes `out/ufo-<version>.tar.gz`, a reproducible source
 archive (the same sources always give the same bytes).
-`scripts/publish.sh` uploads it to museum's exodus repository:
+`scripts/publish.sh` uploads it to kontor's exodus repository:
 
 ```
-MUSEUM_URL=https://museum.example.org MUSEUM_TOKEN=… scripts/publish.sh
+KONTOR_URL=https://kontor.example.org KONTOR_TOKEN=… scripts/publish.sh
 #  PUT /exodus/ufo/<version>/exodus.json
 #  PUT /exodus/ufo/<version>/package
 ```
@@ -202,7 +202,7 @@ lib/tarlayer.aiml  tar reader (streaming) + layer tree from a tar
 lib/identity.aiml  commit identity from the environment
 lib/kit/           the layer kit: contract (api, contracts), OciImages, tar
                    writer/applier, Layout, DirRegistry, HttpRegistry,
-                   LayerHistory, LayoutKit, MuseumKit
+                   LayerHistory, LayoutKit, KontorKit
 lib/imagecli.aiml  `ufo image …`
 lib/cli.aiml       the command line
 ```

@@ -1,4 +1,4 @@
-# ufo.kit.HttpRegistry — an OCI distribution registry over HTTP (museum's
+# ufo.kit.HttpRegistry — an OCI distribution registry over HTTP (kontor's
 # /v2/, doc/kit.md §3).  Blobs go up monolithically (POST + PUT ?digest=)
 # streamed from the file and come down into a temp file that is verified
 # before it enters the layout.  The token travels only in the Authorization

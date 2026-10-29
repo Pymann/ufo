@@ -7,14 +7,14 @@
 #   image pull <reference> <layout> (--registry <url> | --root <dir>)
 #   [-C <git-dir>] image record <layout> --pipeline <p>
 #
-# --registry → ufo.kit.MuseumKit (token from UFO_REGISTRY_TOKEN, never from the
+# --registry → ufo.kit.KontorKit (token from UFO_REGISTRY_TOKEN, never from the
 # command line), --root → ufo.kit.LayoutKit.  This file names only the
 # contract ufo.kit.LayerKit after building the kit.
 - namespace: ufo.imagecli
 
 - import: "kit/api.aiml"
 - import: "kit/layout.aiml"
-- import: "kit/museum.aiml"
+- import: "kit/kontor.aiml"
 
 - class:
     name: ImageCli
@@ -94,7 +94,7 @@
                   - decl: [envm, map<string:string>, { call: [sys.env] }]
                   - decl: [token, string, ""]
                   - if: { condition: { eq: [{ call: [envm.contains, "UFO_REGISTRY_TOKEN"] }, 1] }, then: [{ set: [token, { call: [envm.get, "UFO_REGISTRY_TOKEN"] }] }] }
-                  - decl: [remote, ptr<ufo.kit.LayerKit>, { new: ufo.kit.MuseumKit, url: <.registry, token: token, git_dir: <.git_dir, work_dir: <.work }]
+                  - decl: [remote, ptr<ufo.kit.LayerKit>, { new: ufo.kit.KontorKit, url: <.registry, token: token, git_dir: <.git_dir, work_dir: <.work }]
                   - return: [remote]
             - decl: [local, ptr<ufo.kit.LayerKit>, { new: ufo.kit.LayoutKit, root: <.root, git_dir: <.git_dir, work_dir: <.work }]
             - return: [local]
