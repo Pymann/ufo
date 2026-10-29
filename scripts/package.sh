@@ -1,8 +1,8 @@
 #!/bin/bash
-# Source package of ufo for museum's exodus repository:
+# Source package of ufo for kontor's exodus repository:
 #   scripts/package.sh [<out-dir>]      → <out-dir>/ufo-<version>.tar.gz (default out/)
 # The archive is reproducible (sorted, mtime 0, owner 0:0, gzip -n): the same
-# sources give the same bytes, so museum stores a re-publish once.
+# sources give the same bytes, so kontor stores a re-publish once.
 # It unpacks to ufo-<version>/ with exodus.json at the top: `exodus build` there
 # (with an aiml that has the bytes/fsmeta builtins) builds the binary, and the
 # lib/*.aiml modules can be imported by other aiml projects.

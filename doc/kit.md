@@ -1,7 +1,7 @@
 # ufo.kit — the layer kit (a group interface, aiml spec/58 §12)
 
 Status: **implemented 2026-10-28** — tests/kit.sh 39/39 (incl. part B against
-cosmos-oci), tests/kit_museum.sh 9/9 against a live museum,
+cosmos-oci), tests/kit_kontor.sh 9/9 against a live kontor,
 tests/test_kit_contract.aiml PASS, memcheck clean (0 errors).
 
 Implementation notes:
@@ -19,9 +19,9 @@ Implementation notes:
   cosmos imports through this kit that restriction disappears.
 
 cosmos produces one filesystem layer per pipeline stage, exports them as an OCI
-image, pushes that to museum, pulls images back and lays them out as a rootfs.
+image, pushes that to kontor, pulls images back and lays them out as a rootfs.
 Until now cosmos did this with its own code: a shell converter (`cp -al`, `find`,
-`tar`, `gzip`, `sha256sum` in a helper container) and a museum client.  ufo does
+`tar`, `gzip`, `sha256sum` in a helper container) and a kontor client.  ufo does
 the same work for its own layer commits.  **One implementation, in ufo** — cosmos
 imports it as an exodus package (`- import: "@ufo/lib/kit/…"`, aiml spec/21 §3.1)
 and depends only on the contract.
@@ -58,14 +58,14 @@ Two implementations, both in `@ufo/lib/kit/`:
 
 | group | `registry` talks to | params |
 |---|---|---|
-| `ufo.kit.MuseumKit` | an OCI distribution registry over HTTP (museum's `/v2/`) | `url`, `token` (Bearer; empty = anonymous), `git_dir`, `work_dir` |
+| `ufo.kit.KontorKit` | an OCI distribution registry over HTTP (kontor's `/v2/`) | `url`, `token` (Bearer; empty = anonymous), `git_dir`, `work_dir` |
 | `ufo.kit.LayoutKit` | a directory of layouts on disk (`<root>/<repo>/<tag>/`) — offline, tests, `oci:` targets | `root`, `git_dir`, `work_dir` |
 
 `images` and `history` are the same classes in both.  A user builds one kit at its
 composition root and hands it on as `ptr<ufo.kit.LayerKit>`:
 
 ```yaml
-- decl: [kit, ptr<ufo.kit.LayerKit>, { new: ufo.kit.MuseumKit, url: "https://museum", token: tok, git_dir: g, work_dir: w }]
+- decl: [kit, ptr<ufo.kit.LayerKit>, { new: ufo.kit.KontorKit, url: "https://kontor", token: tok, git_dir: g, work_dir: w }]
 - decl: [rc, i32, { call: [kit.images.export_layers, layers, layout, "build", "amd64"] }]
 - decl: [digest, string, { call: [kit.registry.push, layout, "cosmos-layers/demo:run-7", ""] }]
 ```
@@ -99,7 +99,7 @@ OCI layer tar:
 Per layer: `diff_id` = sha256 of the uncompressed tar, blob = gzip of it
 (`application/vnd.oci.image.layer.v1.tar+gzip`), descriptor annotations
 `cosmos.<key>` for every `layer.meta` line (`stage`, `bindings`, `agent`, `run`, …,
-museum doc/ecosystem.md §3).
+kontor doc/ecosystem.md §3).
 
 Config (`application/vnd.oci.image.config.v1+json`): `architecture: arch`,
 `os: linux`, `rootfs: {type: layers, diff_ids: […]}`, `config: {Env: [PATH=…],
@@ -151,7 +151,7 @@ the first manifest is taken and its platform recorded in `index.json`), config a
 layer blobs, each verified against its digest while it is written, into a fresh
 layout.
 
-Auth (`MuseumKit`): `token` → `Authorization: Bearer <token>`; the token is never
+Auth (`KontorKit`): `token` → `Authorization: Bearer <token>`; the token is never
 written to a log.  An HTTP error → `""` and a log line with the status, never the
 token.
 
@@ -183,7 +183,7 @@ ufo image pull <reference> <layout> (--registry <url> | --root <dir>)
 ufo [-C <git-dir>] image record <layout> --pipeline <p>
 ```
 
-`--registry` builds a `MuseumKit` (token from `UFO_REGISTRY_TOKEN`, never from the
+`--registry` builds a `KontorKit` (token from `UFO_REGISTRY_TOKEN`, never from the
 command line), `--root` a `LayoutKit`; `--ref` defaults to `latest`, `--arch` to
 `amd64`.  push/pull print the manifest digest; every command exits 0 on success, 1
 with a message otherwise.  The CLI holds only `ptr<ufo.kit.LayerKit>` — it is the
@@ -196,6 +196,6 @@ first user of the contract.
 | `tests/kit.sh` part A (LayoutKit, no network) | an overlay upper as the kernel writes it (real overlayfs mount where permitted, else the same shapes via mknod/xattrs): `export_layers` → layout passes a reader written independently in Python (digests, diff_ids, sizes, media types, annotations); reproducible (two exports, one digest); `import_image` → rootfs equals the merged overlay view (types, modes, owners, devices, symlinks, contents, xattr); push/pull through `LayoutKit` keep the digest |
 | `tests/kit.sh` part B (cosmos compatibility) | the layout ufo writes is read by cosmos' existing importer; a layout cosmos' exporter wrote is imported by ufo — same rootfs |
 | `tests/kit.sh` part C (history) | `record` → one commit per stage under `refs/layers/<p>/<stage>` with the trailers; `git fsck` clean; the tree equals `ufo layer commit` of the same upper |
-| `tests/kit_museum.sh` (MuseumKit, live museum) | push → museum's `/api/v1/layers/<p>/<run>` lists the stages with their annotations; pull into a fresh layout → same manifest digest, same rootfs; wrong token → `""`, token not in any log |
+| `tests/kit_kontor.sh` (KontorKit, live kontor) | push → kontor's `/api/v1/layers/<p>/<run>` lists the stages with their annotations; pull into a fresh layout → same manifest digest, same rootfs; wrong token → `""`, token not in any log |
 | `tests/test_kit_contract.aiml` | user code that names only `ptr<ufo.kit.LayerKit>` drives both kits (aiml spec/58 §12) |
 | valgrind | the contract test under memcheck: no memory errors, no leak from generated code |
