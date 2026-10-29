@@ -111,12 +111,39 @@ Layer refs are ordinary refs:
 Limits: hard links are stored as separate files (the content is still
 stored once), and `.ufo-attributes` and `.ufo-keep` are reserved names.
 
+## Images
+
+`ufo image` turns layers into OCI images and back, moves images to and from a
+registry and records them as layer commits — the layer kit (doc/kit.md), which
+cosmos uses too:
+
+```
+ufo image export-layers <layers> <layout> [--ref <name>] [--arch <arch>]   # <layers>/<n>/upper (+ layer.meta)
+ufo image export-dir    <dir> <layout>    [--ref <name>] [--arch <arch>]   # one layer from a rootfs
+ufo image import        <layout> <rootfs> [--arch <arch>]
+ufo image push <layout> <repo>:<tag> (--registry <url> | --root <dir>) [--artifact-type <t>]
+ufo image pull <repo>:<tag> <layout> (--registry <url> | --root <dir>)
+ufo [-C <git-dir>] image record <layout> --pipeline <p>   # one layer commit per stage
+```
+
+Exports are reproducible (sorted pax tar, fixed timestamps in config and gzip):
+the same upper directory always gives the same digest. Whiteouts, opaque
+directories, owners, modes, device nodes, fifos, hard links, symlinks and
+xattrs survive export and import. `--registry` talks to an OCI distribution
+registry such as museum (`UFO_REGISTRY_TOKEN` = Bearer token, never on the
+command line, never logged); `--root` uses a directory of layouts instead.
+
+In aiml code the kit is one contract, `ufo.kit.LayerKit` (lib/kit/api.aiml),
+with two implementations, `ufo.kit.MuseumKit` and `ufo.kit.LayoutKit`.
+
 ## Building
 
 ufo needs an aiml compiler with the `bytes`, `hash.sha1` and `fsmeta`
 builtins and method calls on `shared<Class>` — aiml `mem-v3-compiler` from 34c3340 on
 (feature/git-support-memv3 and fix/shared-method-call-memv3 are merged there) — and memV3
-(`AIML_MEM_V3=1`).
+(`AIML_MEM_V3=1`). `ufo image` additionally needs classgroup interfaces, the
+file-streaming `bytes` builtins and the fixes for namespaced classes/classgroups
+and the HTTP client — aiml `mem-v3-compiler` from 58efe0c on.
 
 ```
 exodus build                      # ./ufo, with ../aiml as in exodus.json
@@ -132,7 +159,12 @@ UFO=./ufo tests/remote.sh    # smart HTTP against git http-backend (26 checks)
 UFO=./ufo tests/layer.sh     # layers against a real overlayfs mount (33 checks; root)
 AIML_MEM_V3=1 aiml tests/test_object.aiml
 AIML_BIN=aiml MUSEUM_DIR=../museum tests/package.sh   # package → museum → download → run
+UFO=./ufo tests/kit.sh       # images: export/import/registry/history (39 checks with cosmos; root)
+AIML_BIN=aiml MUSEUM_DIR=../museum UFO=./ufo tests/kit_museum.sh   # MuseumKit against a live museum
+AIML_MEM_V3=1 aiml tests/test_kit_contract.aiml                    # one user, two kits
 ```
+`tests/kit.sh` part B runs when `COSMOS_RT_OCI` (cosmos' `cosmos-oci`) and
+`COSMOS_BASE` are set.
 
 ## Distribution through museum
 
@@ -166,5 +198,11 @@ lib/worktree.aiml  directory ⇄ tree
 lib/layer.aiml     layer scan / commit / apply
 lib/layerdiff.aiml layer diff
 lib/layercli.aiml  `ufo layer …`
+lib/tarlayer.aiml  tar reader (streaming) + layer tree from a tar
+lib/identity.aiml  commit identity from the environment
+lib/kit/           the layer kit: contract (api, contracts), OciImages, tar
+                   writer/applier, Layout, DirRegistry, HttpRegistry,
+                   LayerHistory, LayoutKit, MuseumKit
+lib/imagecli.aiml  `ufo image …`
 lib/cli.aiml       the command line
 ```

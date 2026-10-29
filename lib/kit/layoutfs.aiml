@@ -1,0 +1,191 @@
+# ufo.kit.Layout — the OCI image layout on disk, shared by ufo.kit.OciImages
+# and both registries: blobs in, blobs verified, the manifest an index points
+# to, index.json written with sorted keys.
+- namespace: ufo.kit
+
+- import: "model_image.aiml"
+- import: "json.aiml"
+
+- class:
+    name: Layout
+    members:
+      - [work, string, ".ufo-kit", { access: public }]
+      - [error, string, "", { access: public }]
+      # filled by manifest_for:
+      - [man_size, i64, 0, { access: public }]
+      - [ref_name, string, "", { access: public }]
+      - [arch, string, "", { access: public }]
+    methods:
+      - def:
+          name: bad
+          args: [[message, string]]
+          return: string
+          body:
+            - set: [<.error, message]
+            - return: [""]
+
+      - def:
+          name: tmp_file
+          args: [[label, string]]
+          return: string
+          body:
+            - call: [io.mkdir_all, <.work]
+            - return: ["${<.work}/${label}-${{ call: [math.random_hex, 8] }}"]
+
+      - def:
+          name: blob_path
+          args: [[layout, string], [hex, string]]
+          return: string
+          body:
+            - return: ["${layout}/blobs/sha256/${hex}"]
+
+      # Moves file `src` into the blobs of `layout`; checks it against `expect`
+      # ("" = take what it hashes to).  The blob's hex, "" on error.
+      - def:
+          name: adopt
+          static_off: ["str_cmp"]
+          args: [[layout, string], [src, string], [expect, string]]
+          return: string
+          body:
+            - decl: [hex, string, { call: [hash.sha256_file, src] }]
+            - if: { condition: { neq: [hex.len, 64] }, then: [{ return: [{ call: [<.bad, "cannot read ${src}"] }] }] }
+            - if:
+                condition: { and: [{ gt: [expect.len, 0] }, { neq: [hex, expect] }] }
+                then:
+                  - call: [io.remove, src]
+                  - return: [{ call: [<.bad, "blob sha256:${expect} does not match its digest"] }]
+            - decl: [dest, string, { call: [<.blob_path, layout, hex] }]
+            - call: [io.mkdir_all, "${layout}/blobs/sha256"]
+            - if: { condition: { call: [io.exists, dest] }, then: [{ call: [io.remove, src] }, { return: [hex] }] }
+            - if:
+                condition: { neq: [{ call: [io.rename, src, dest] }, 0] }
+                then:
+                  # another filesystem: copy, then drop the source
+                  - if: { condition: { lt: [{ call: [bytes.copy_range, src, 0, -1, dest] }, 0] }, then: [{ return: [{ call: [<.bad, "cannot write ${dest}"] }] }] }
+                  - call: [io.remove, src]
+            - return: [hex]
+
+      - def:
+          name: text_blob
+          args: [[layout, string], [text, string]]
+          return: string
+          body:
+            - decl: [tmp, string, { call: [<.tmp_file, "blob"] }]
+            - call: [io.write_file, tmp, text]
+            - return: [{ call: [<.adopt, layout, tmp, ""] }]
+
+      # Is blob `hex` of `layout` present and what its digest says?
+      - def:
+          name: verified
+          static_off: ["str_cmp"]
+          args: [[layout, string], [hex, string]]
+          return: i32
+          body:
+            - decl: [path_at, string, { call: [<.blob_path, layout, hex] }]
+            - if: { condition: { not: [{ call: [io.is_file, path_at] }] }, then: [{ call: [<.bad, "blob sha256:${hex} missing in ${layout}"] }, { return: [0] }] }
+            - if: { condition: { neq: [{ call: [hash.sha256_file, path_at] }, hex] }, then: [{ call: [<.bad, "blob sha256:${hex} does not match its digest"] }, { return: [0] }] }
+            - return: [1]
+
+      # Copies blob `hex` from layout `src` to layout `dst`, verified.  0 / 1.
+      - def:
+          name: copy_blob
+          args: [[src, string], [hex, string], [dst, string]]
+          return: i32
+          body:
+            - if: { condition: { call: [io.is_file, { call: [<.blob_path, dst, hex] }] }, then: [{ return: [{ call: [<.verified, dst, hex] }] }] }
+            - decl: [tmp, string, { call: [<.tmp_file, "copy"] }]
+            - if: { condition: { lt: [{ call: [bytes.copy_range, { call: [<.blob_path, src, hex] }, 0, -1, tmp] }, 0] }, then: [{ call: [<.bad, "blob sha256:${hex} missing in ${src}"] }, { return: [1] }] }
+            - decl: [got, string, { call: [<.adopt, dst, tmp, hex] }]
+            - if: { condition: { eq: [got.len, 0] }, then: [{ return: [1] }] }
+            - return: [0]
+
+      # The manifest index.json of `layout` names for `arch` ("" = the first).
+      # Its hex; ref_name / arch / man_size are filled.  "" + error otherwise.
+      - def:
+          name: manifest_for
+          static_off: ["str_cmp"]
+          args: [[layout, string], [arch, string]]
+          return: string
+          body:
+            - if: { condition: { not: [{ call: [io.is_file, "${layout}/index.json"] }] }, then: [{ return: [{ call: [<.bad, "${layout}/index.json missing — not an image layout"] }] }] }
+            - decl: [raw, string, { call: [io.read_file, "${layout}/index.json"] }]
+            - decl: [index, ufo.kit.KitIndex, { call: [sys.deserialize, raw, "ufo.kit.KitIndex"] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, index.manifests.len] }
+                body:
+                  - decl: [ref, ufo.kit.KitRef, { at: [index.manifests, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [has, string, ref.platform.architecture]
+                  - if:
+                      condition: { or: [{ eq: [arch.len, 0] }, { or: [{ eq: [has, arch] }, { eq: [has.len, 0] }] }] }
+                      then:
+                        - if: { condition: { eq: [{ call: [ref.digest.starts_with, "sha256:"] }, 0] }, then: [{ return: [{ call: [<.bad, "${layout}: unsupported digest ${ref.digest}"] }] }] }
+                        - set: [<.man_size, ref.size]
+                        - set: [<.arch, has]
+                        - set: [<.ref_name, ""]
+                        - if: { condition: { eq: [{ call: [ref.annotations.contains, "org.opencontainers.image.ref.name"] }, 1] }, then: [{ set: [<.ref_name, { call: [ref.annotations.get, "org.opencontainers.image.ref.name"] }] }] }
+                        - return: [{ call: [ref.digest.substr, 7] }]
+            - if: { condition: { eq: [arch.len, 0] }, then: [{ return: [{ call: [<.bad, "${layout}: index.json names no manifest"] }] }] }
+            - return: [{ call: [<.bad, "${layout}: no manifest for ${arch}"] }]
+
+      # The manifest blob `man_hex` of `layout`, parsed (after verifying it).
+      - def:
+          name: manifest
+          args: [[layout, string], [man_hex, string]]
+          return: ufo.kit.KitManifest
+          body:
+            - decl: [none, ufo.kit.KitManifest]
+            - if: { condition: { eq: [{ call: [<.verified, layout, man_hex] }, 0] }, then: [{ return: [none] }] }
+            - return: [{ call: [sys.deserialize, { call: [io.read_file, { call: [<.blob_path, layout, man_hex] }] }, "ufo.kit.KitManifest"] }]
+
+      # config + layer hexes of a manifest (the manifest itself not included).
+      - def:
+          name: blobs_of
+          args: [[layout, string], [man_hex, string]]
+          return: list<string>
+          body:
+            - decl: [out, list<string>]
+            - decl: [man, ufo.kit.KitManifest, { call: [<.manifest, layout, man_hex] }]
+            - if: { condition: { gt: [man.config.digest.len, 7] }, then: [{ call: [out.push, { call: [man.config.digest.substr, 7] }] }] }
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, man.layers.len] }
+                body:
+                  - decl: [lay, ufo.kit.KitDesc, { at: [man.layers, idx] }]
+                  - call: [out.push, { call: [lay.digest.substr, 7] }]
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [out]
+
+      # The manifest with `artifactType` set, as an added blob; its hex.
+      # (Keys stay sorted: "artifactType" sorts before every manifest key.)
+      - def:
+          name: with_artifact_type
+          static_off: ["str_cmp"]
+          args: [[layout, string], [man_hex, string], [artifact_type, string]]
+          return: string
+          body:
+            - decl: [man, ufo.kit.KitManifest, { call: [<.manifest, layout, man_hex] }]
+            - if: { condition: { eq: [man.mediaType.len, 0] }, then: [{ return: [""] }] }
+            - if: { condition: { eq: [man.artifactType, artifact_type] }, then: [{ return: [man_hex] }] }
+            - if: { condition: { gt: [man.artifactType.len, 0] }, then: [{ return: [{ call: [<.bad, "${layout}: the manifest already has artifactType ${man.artifactType}"] }] }] }
+            - decl: [text, string, { call: [io.read_file, { call: [<.blob_path, layout, man_hex] }] }]
+            - if: { condition: { eq: [{ call: [text.starts_with, "{"] }, 0] }, then: [{ return: [{ call: [<.bad, "${layout}: malformed manifest"] }] }] }
+            - decl: [art, string, { call: [ufo.kit.jstr, artifact_type] }]
+            - decl: [rest, string, { call: [text.substr, 1] }]
+            - return: [{ call: [<.text_blob, layout, "{\"artifactType\":${art},${rest}"] }]
+
+      # index.json (one manifest) + oci-layout.
+      - def:
+          name: write_index
+          args: [[layout, string], [man_hex, string], [man_size, i64], [ref_name, string], [arch, string]]
+          body:
+            - decl: [refn, string, { call: [ufo.kit.jstr, ref_name] }]
+            - decl: [archj, string, { call: [ufo.kit.jstr, arch] }]
+            - decl: [notes, string, ""]
+            - if: { condition: { gt: [ref_name.len, 0] }, then: [{ set: [notes, "\"annotations\":{\"org.opencontainers.image.ref.name\":${refn}},"] }] }
+            - decl: [plat, string, ""]
+            - if: { condition: { gt: [arch.len, 0] }, then: [{ set: [plat, ",\"platform\":{\"architecture\":${archj},\"os\":\"linux\"}"] }] }
+            - call: [io.mkdir_all, layout]
+            - call: [io.write_file, "${layout}/index.json", "{\"manifests\":[{${notes}\"digest\":\"sha256:${man_hex}\",\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"${plat},\"size\":${man_size}}],\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"schemaVersion\":2}"]
+            - call: [io.write_file, "${layout}/oci-layout", "{\"imageLayoutVersion\":\"1.0.0\"}"]

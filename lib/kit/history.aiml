@@ -1,0 +1,125 @@
+# ufo.kit.LayerHistory — an image's layers as ufo layer commits (doc/kit.md §4).
+# The tree comes from the tar headers (ufo.tarlayer), so owners, devices and
+# xattrs need no privileges.  One commit per layer on refs/layers/<p>/<stage>.
+- namespace: ufo.kit
+
+- import: "contracts.aiml"
+- import: "layoutfs.aiml"
+- import: "../repo.aiml"
+- import: "../layer.aiml"
+- import: "../tarlayer.aiml"
+- import: "../identity.aiml"
+
+- class:
+    name: LayerHistory
+    implements: [ufo.kit.History]
+    members:
+      - [git_dir, string, "."]
+      - [work, string, ".ufo-kit"]
+    methods:
+      - def:
+          name: setup
+          args: [[git_dir, string], [work_dir, string]]
+          body:
+            - if: { condition: { gt: [git_dir.len, 0] }, then: [{ set: [<.git_dir, git_dir] }] }
+            - if: { condition: { gt: [work_dir.len, 0] }, then: [{ set: [<.work, work_dir] }] }
+
+      - def:
+          name: fail
+          args: [[message, string]]
+          return: i32
+          body:
+            - call: [log.error, "ufo: ${message}"]
+            - return: [-1]
+
+      # A descriptor annotation ("" when absent).
+      - def:
+          name: note
+          args: [[desc, ufo.kit.KitDesc], [key, string]]
+          return: string
+          body:
+            - if: { condition: { eq: [{ call: [desc.annotations.contains, key] }, 1] }, then: [{ return: [{ call: [desc.annotations.get, key] }] }] }
+            - return: [""]
+
+      # The commit metadata of layer `num` (descriptor `desc`) of image `man_hex`.
+      - def:
+          name: meta_of
+          args: [[desc, ufo.kit.KitDesc], [num, i32], [pipeline, string], [man_hex, string]]
+          return: ufo.layer.Meta
+          body:
+            - decl: [meta, ufo.layer.Meta]
+            - set: [meta.pipeline, pipeline]
+            - set: [meta.stage, { call: [<.note, desc, "cosmos.stage"] }]
+            - if: { condition: { eq: [meta.stage.len, 0] }, then: [{ set: [meta.stage, "layer${num}"] }] }
+            - set: [meta.run, { call: [<.note, desc, "cosmos.run"] }]
+            - set: [meta.step, { call: [<.note, desc, "cosmos.step_key"] }]
+            - set: [meta.agent, { call: [<.note, desc, "cosmos.agent"] }]
+            - decl: [bound, string, { call: [<.note, desc, "cosmos.bindings"] }]
+            - if:
+                condition: { gt: [bound.len, 0] }
+                then:
+                  - decl: [pairs, list<string>, { call: [bound.split, ","] }]
+                  - decl: [idx, i32, 0]
+                  - while:
+                      condition: { lt: [idx, pairs.len] }
+                      body:
+                        - decl: [pair, string, { call: [pairs.get, idx] }]
+                        - set: [idx, { +: [idx, 1] }]
+                        - if: { condition: { gt: [pair.len, 0] }, then: [{ call: [meta.bindings.push, pair] }] }
+            - call: [meta.extra.push, "Ufo-Digest: ${desc.digest}"]
+            - call: [meta.extra.push, "Ufo-Image: sha256:${man_hex}"]
+            - return: [meta]
+
+      # Is the tip of the stage's ref already this layer of this run?
+      - def:
+          name: recorded
+          static_off: ["str_cmp"]
+          args: [[repo, ref<ufo.repo.Repository>], [meta, ufo.layer.Meta], [digest, string]]
+          return: i32
+          body:
+            - decl: [tip, string, { call: [repo.resolve, { call: [ufo.layer.ref_name, meta.pipeline, meta.stage] }] }]
+            - if: { condition: { neq: [tip.len, 40] }, then: [{ return: [0] }] }
+            - decl: [cmt, ufo.object.Commit, { call: [repo.read_commit, tip] }]
+            - if: { condition: { neq: [{ call: [ufo.layer.trailer, cmt.message, "Ufo-Digest"] }, digest] }, then: [{ return: [0] }] }
+            - if: { condition: { neq: [{ call: [ufo.layer.trailer, cmt.message, "Ufo-Run"] }, meta.run] }, then: [{ return: [0] }] }
+            - return: [1]
+
+      - def:
+          name: record
+          static_off: ["str_cmp"]
+          args: [[layout, string], [pipeline, string]]
+          return: i32
+          body:
+            - if: { condition: { eq: [{ call: [ufo.layer.valid_part, pipeline, 1] }, 0] }, then: [{ return: [{ call: [<.fail, "record: '${pipeline}' is not a valid pipeline name"] }] }] }
+            - decl: [repo, ptr<ufo.repo.Repository>, { new: ufo.repo.Repository }]
+            - if: { condition: { eq: [{ call: [repo.open, <.git_dir] }, 0] }, then: [{ return: [{ call: [<.fail, "not a git repository: ${<.git_dir}"] }] }] }
+            - decl: [lay, ptr<ufo.kit.Layout>, { new: ufo.kit.Layout }]
+            - set: [lay.work, <.work]
+            - decl: [man_hex, string, { call: [lay.manifest_for, layout, ""] }]
+            - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [man, ufo.kit.KitManifest, { call: [lay.manifest, layout, man_hex] }]
+            - if: { condition: { eq: [man.mediaType.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [author, string, { call: [ufo.identity.current, "COMMITTER"] }]
+            - decl: [made, i32, 0]
+            - decl: [num, i32, 0]
+            - while:
+                condition: { lt: [num, man.layers.len] }
+                body:
+                  - decl: [desc, ufo.kit.KitDesc, { at: [man.layers, num] }]
+                  - decl: [meta, ufo.layer.Meta, { call: [<.meta_of, desc, num, pipeline, man_hex] }]
+                  - set: [num, { +: [num, 1] }]
+                  - if: { condition: { eq: [{ call: [ufo.layer.valid_part, meta.stage, 0] }, 0] }, then: [{ return: [{ call: [<.fail, "record: stage '${meta.stage}' is not a valid ref name"] }] }] }
+                  - if:
+                      condition: { eq: [{ call: [<.recorded, repo, meta, desc.digest] }, 0] }
+                      then:
+                        - decl: [hex, string, { call: [desc.digest.substr, 7] }]
+                        - if: { condition: { eq: [{ call: [lay.verified, layout, hex] }, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+                        - decl: [tar, string, { call: [lay.tmp_file, "record"] }]
+                        - if: { condition: { lt: [{ call: [bytes.gunzip_file, { call: [lay.blob_path, layout, hex] }, tar] }, 0] }, then: [{ return: [{ call: [<.fail, "layer ${desc.digest} is not gzip"] }] }] }
+                        - decl: [tree, string, { call: [ufo.tarlayer.layer_tree, repo, tar] }]
+                        - call: [io.remove, tar]
+                        - if: { condition: { neq: [tree.len, 40] }, then: [{ return: [-1] }] }
+                        - decl: [cmt, string, { call: [ufo.layer.commit, repo, tree, meta, author, 1] }]
+                        - call: [log.info, "ufo: ${pipeline}/${meta.stage} ← ${desc.digest} (${cmt})"]
+                        - set: [made, { +: [made, 1] }]
+            - return: [made]

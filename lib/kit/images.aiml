@@ -1,0 +1,204 @@
+# ufo.kit.OciImages — layers ⇄ an OCI image layout (doc/kit.md §2).
+- namespace: ufo.kit
+
+- import: "contracts.aiml"
+- import: "model_config.aiml"
+- import: "json.aiml"
+- import: "layoutfs.aiml"
+- import: "tarwrite.aiml"
+- import: "tarapply.aiml"
+
+- class:
+    name: OciImages
+    implements: [ufo.kit.Images]
+    members:
+      - [work, string, ".ufo-kit"]
+    methods:
+      - def:
+          name: setup
+          args: [[work_dir, string]]
+          body:
+            - if: { condition: { gt: [work_dir.len, 0] }, then: [{ set: [<.work, work_dir] }] }
+
+      - def:
+          name: fail
+          args: [[message, string]]
+          return: i32
+          body:
+            - call: [log.error, "ufo: ${message}"]
+            - return: [1]
+
+      # The layout helper, working in this kit's work dir.
+      - def:
+          name: files
+          return: ptr<ufo.kit.Layout>
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { new: ufo.kit.Layout }]
+            - set: [lay.work, <.work]
+            - return: [lay]
+
+      # A directory as one gzip'd layer blob.  "<hex> <size> <diff_id-hex>" or "".
+      - def:
+          name: layer_blob
+          args: [[dir, string], [layout, string], [overlay, i32]]
+          return: string
+          body:
+            - call: [io.mkdir_all, <.work]
+            - decl: [stamp, string, { call: [math.random_hex, 6] }]
+            - decl: [tar, string, "${<.work}/layer-${stamp}.tar"]
+            - decl: [writer, ptr<ufo.kit.TarWriter>, { new: ufo.kit.TarWriter }]
+            - set: [writer.out, tar]
+            - set: [writer.overlay, overlay]
+            - if:
+                condition: { neq: [{ call: [writer.write_dir, dir] }, 0] }
+                then:
+                  - call: [log.error, "ufo: ${dir}: ${writer.error}"]
+                  - return: [""]
+            - decl: [diff, string, { call: [hash.sha256_file, tar] }]
+            - decl: [gz_path, string, "${tar}.gz"]
+            - if: { condition: { lt: [{ call: [bytes.gzip_file, tar, gz_path, 6] }, 0] }, then: [{ call: [log.error, "ufo: cannot compress ${tar}"] }, { return: [""] }] }
+            - call: [io.remove, tar]
+            - decl: [size, i64, { call: [io.file_size, gz_path] }]
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [hex, string, { call: [lay.adopt, layout, gz_path, ""] }]
+            - if: { condition: { eq: [hex.len, 0] }, then: [{ call: [log.error, "ufo: ${lay.error}"] }, { return: [""] }] }
+            - return: ["${hex} ${size} ${diff}"]
+
+      # `key=value` lines → a sorted {"cosmos.key":"value",…} object ("" if none).
+      - def:
+          name: meta_annotations
+          args: [[meta_at, string]]
+          return: string
+          body:
+            - if: { condition: { not: [{ call: [io.is_file, meta_at] }] }, then: [{ return: [""] }] }
+            - decl: [text, string, { call: [io.read_file, meta_at] }]
+            - decl: [rows, list<string>, { call: [text.split, "\n"] }]
+            - decl: [keys, list<string>]
+            - decl: [vals, list<string>]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, rows.len] }
+                body:
+                  - decl: [row, string, { call: [rows.get, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [cut, i32, { call: [row.index_of, "="] }]
+                  - if:
+                      condition: { gt: [cut, 0] }
+                      then:
+                        - call: [keys.push, "cosmos.${{ call: [row.substr, 0, cut] }}"]
+                        - call: [vals.push, { call: [ufo.kit.jstr, { call: [row.substr, { +: [cut, 1] }] }] }]
+            - if: { condition: { eq: [keys.len, 0] }, then: [{ return: [""] }] }
+            - return: [{ call: [ufo.kit.jobject, keys, vals] }]
+
+      # config + manifest + index.json + oci-layout for the given layers.
+      #   blobs[i] = "<hex> <size> <diff_id>", notes[i] = annotations object or ""
+      - def:
+          name: write_image
+          args: [[layout, string], [blobs, list<string>], [notes, list<string>], [ref_name, string], [arch, string]]
+          return: i32
+          body:
+            - decl: [diffs, string, ""]
+            - decl: [descs, string, ""]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, blobs.len] }
+                body:
+                  - decl: [line, string, { call: [blobs.get, idx] }]
+                  - decl: [parts, list<string>, { call: [line.split, " "] }]
+                  - decl: [note, string, { call: [notes.get, idx] }]
+                  - decl: [keys, list<string>, ["digest", "mediaType", "size"]]
+                  - decl: [vals, list<string>]
+                  - call: [vals.push, { call: [ufo.kit.jstr, "sha256:${{ call: [parts.get, 0] }}"] }]
+                  - call: [vals.push, { call: [ufo.kit.jstr, "application/vnd.oci.image.layer.v1.tar+gzip"] }]
+                  - call: [vals.push, { call: [parts.get, 1] }]
+                  - if: { condition: { gt: [note.len, 0] }, then: [{ call: [keys.push, "annotations"] }, { call: [vals.push, note] }] }
+                  - if: { condition: { gt: [idx, 0] }, then: [{ set: [descs, "${descs},"] }, { set: [diffs, "${diffs},"] }] }
+                  - set: [descs, "${descs}${{ call: [ufo.kit.jobject, keys, vals] }}"]
+                  - decl: [diff_hex, string, { call: [parts.get, 2] }]
+                  - decl: [diff_id, string, { call: [ufo.kit.jstr, "sha256:${diff_hex}"] }]
+                  - set: [diffs, "${diffs}${diff_id}"]
+                  - set: [idx, { +: [idx, 1] }]
+            - decl: [path_env, string, { call: [ufo.kit.jstr, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"] }]
+            - decl: [cfg, string, "{\"architecture\":${{ call: [ufo.kit.jstr, arch] }},\"config\":{\"Cmd\":[\"/bin/sh\"],\"Env\":[${path_env}]},\"created\":\"1970-01-01T00:00:00Z\",\"os\":\"linux\",\"rootfs\":{\"diff_ids\":[${diffs}],\"type\":\"layers\"}}"]
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [cfg_hex, string, { call: [lay.text_blob, layout, cfg] }]
+            - if: { condition: { eq: [cfg_hex.len, 0] }, then: [{ return: [{ call: [<.fail, "cannot write the config of ${layout}"] }] }] }
+            - decl: [cfg_desc, string, "{\"digest\":\"sha256:${cfg_hex}\",\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"size\":${cfg.len}}"]
+            - decl: [man, string, "{\"config\":${cfg_desc},\"layers\":[${descs}],\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"schemaVersion\":2}"]
+            - decl: [man_hex, string, { call: [lay.text_blob, layout, man] }]
+            - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, "cannot write the manifest of ${layout}"] }] }] }
+            - call: [lay.write_index, layout, man_hex, man.len, ref_name, arch]
+            - call: [log.info, "ufo: ${layout}: ${blobs.len} layers, manifest sha256:${man_hex}"]
+            - return: [0]
+
+      - def:
+          name: export_layers
+          args: [[layers, string], [layout, string], [ref_name, string], [arch, string]]
+          return: i32
+          body:
+            - if: { condition: { not: [{ call: [io.is_dir, layers] }] }, then: [{ return: [{ call: [<.fail, "${layers} is not a directory"] }] }] }
+            - decl: [blobs, list<string>]
+            - decl: [notes, list<string>]
+            - decl: [num, i32, 0]
+            - while:
+                condition: { lt: [num, 256] }
+                body:
+                  - decl: [upper, string, "${layers}/${num}/upper"]
+                  - decl: [meta_at, string, "${layers}/${num}/layer.meta"]
+                  - set: [num, { +: [num, 1] }]
+                  - if:
+                      condition: { call: [io.is_dir, upper] }
+                      then:
+                        - decl: [blob, string, { call: [<.layer_blob, upper, layout, 1] }]
+                        - if: { condition: { eq: [blob.len, 0] }, then: [{ return: [1] }] }
+                        - call: [blobs.push, blob]
+                        - call: [notes.push, { call: [<.meta_annotations, meta_at] }]
+            - if: { condition: { eq: [blobs.len, 0] }, then: [{ return: [{ call: [<.fail, "no layers under ${layers} (expected <n>/upper)"] }] }] }
+            - return: [{ call: [<.write_image, layout, blobs, notes, ref_name, arch] }]
+
+      - def:
+          name: export_dir
+          args: [[dir, string], [layout, string], [ref_name, string], [arch, string]]
+          return: i32
+          body:
+            - if: { condition: { not: [{ call: [io.is_dir, dir] }] }, then: [{ return: [{ call: [<.fail, "${dir} is not a directory"] }] }] }
+            - decl: [probe, list<path>, { call: [io.list_dir, dir] }]
+            - if: { condition: { eq: [probe.len, 0] }, then: [{ return: [{ call: [<.fail, "${dir} is empty — nothing to export"] }] }] }
+            - decl: [blob, string, { call: [<.layer_blob, dir, layout, 0] }]
+            - if: { condition: { eq: [blob.len, 0] }, then: [{ return: [1] }] }
+            - decl: [blobs, list<string>]
+            - call: [blobs.push, blob]
+            - decl: [notes, list<string>]
+            - call: [notes.push, ""]
+            - return: [{ call: [<.write_image, layout, blobs, notes, ref_name, arch] }]
+
+      - def:
+          name: import_image
+          static_off: ["str_cmp"]
+          args: [[layout, string], [rootfs, string], [arch, string]]
+          return: i32
+          body:
+            - decl: [lay, ptr<ufo.kit.Layout>, { call: [<.files] }]
+            - decl: [man_hex, string, { call: [lay.manifest_for, layout, arch] }]
+            - if: { condition: { eq: [man_hex.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - decl: [man, ufo.kit.KitManifest, { call: [lay.manifest, layout, man_hex] }]
+            - if: { condition: { eq: [man.mediaType.len, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+            - call: [io.mkdir_all, rootfs]
+            - call: [io.mkdir_all, <.work]
+            - decl: [applier, ptr<ufo.kit.TarApplier>, { new: ufo.kit.TarApplier }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, man.layers.len] }
+                body:
+                  - decl: [desc, ufo.kit.KitDesc, { at: [man.layers, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - decl: [hex, string, { call: [desc.digest.substr, 7] }]
+                  - if: { condition: { eq: [{ call: [lay.verified, layout, hex] }, 0] }, then: [{ return: [{ call: [<.fail, lay.error] }] }] }
+                  - decl: [tar, string, "${<.work}/apply-${{ call: [math.random_hex, 6] }}.tar"]
+                  - if: { condition: { lt: [{ call: [bytes.gunzip_file, "${layout}/blobs/sha256/${hex}", tar] }, 0] }, then: [{ return: [{ call: [<.fail, "layer sha256:${hex} is not gzip"] }] }] }
+                  - decl: [applied, i32, { call: [applier.apply, tar, rootfs] }]
+                  - call: [io.remove, tar]
+                  - if: { condition: { neq: [applied, 0] }, then: [{ return: [{ call: [<.fail, "layer sha256:${hex}: ${applier.error}"] }] }] }
+            - call: [applier.finish]
+            - call: [log.info, "ufo: ${layout} → ${rootfs}: ${man.layers.len} layers"]
+            - return: [0]

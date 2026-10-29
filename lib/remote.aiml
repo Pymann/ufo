@@ -99,6 +99,7 @@
                   - call: [io.write_file, req_file, body]
                   - set: [client.body_file, req_file]
             - decl: [answer, http_response_handle, { call: [client.send] }]
+            - call: [client.free]
             - if: { condition: { call: [io.exists, req_file] }, then: [{ call: [io.remove, req_file] }] }
             - if:
                 condition: { eq: [answer, null] }

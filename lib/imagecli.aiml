@@ -1,0 +1,154 @@
+# ufo.imagecli — `ufo image …`, thin over the layer kit (doc/kit.md §5).
+#
+#   image export-layers <layers> <layout> [--ref <name>] [--arch <arch>]
+#   image export-dir    <dir> <layout>    [--ref <name>] [--arch <arch>]
+#   image import        <layout> <rootfs> [--arch <arch>]
+#   image push <layout> <reference> (--registry <url> | --root <dir>) [--artifact-type <t>]
+#   image pull <reference> <layout> (--registry <url> | --root <dir>)
+#   [-C <git-dir>] image record <layout> --pipeline <p>
+#
+# --registry → ufo.kit.MuseumKit (token from UFO_REGISTRY_TOKEN, never from the
+# command line), --root → ufo.kit.LayoutKit.  This file names only the
+# contract ufo.kit.LayerKit after building the kit.
+- namespace: ufo.imagecli
+
+- import: "kit/api.aiml"
+- import: "kit/layout.aiml"
+- import: "kit/museum.aiml"
+
+- class:
+    name: ImageCli
+    members:
+      - [args, list<string>, null, { access: public }]
+      - [git_dir, string, ".", { access: public }]
+      # parsed options
+      - [words, list<string>]
+      - [ref_name, string, "latest"]
+      - [arch, string, ""]
+      - [registry, string, ""]
+      - [root, string, ""]
+      - [artifact_type, string, ""]
+      - [pipeline, string, ""]
+      - [work, string, ""]
+    methods:
+      - def:
+          name: fail
+          args: [[message, string]]
+          return: i32
+          body:
+            - call: [log.error, "ufo image: ${message}"]
+            - return: [1]
+
+      - def:
+          name: word
+          args: [[pos, i32]]
+          return: string
+          body:
+            - if: { condition: { ge: [pos, <.words.len] }, then: [{ return: [""] }] }
+            - return: [{ call: [<.words.get, pos] }]
+
+      # Options anywhere after the subcommand; the rest are words.  "" = ok.
+      - def:
+          name: parse
+          static_off: ["str_cmp"]
+          args: [[first, i32]]
+          return: string
+          body:
+            - decl: [idx, i32, first]
+            - while:
+                condition: { lt: [idx, <.args.len] }
+                body:
+                  - decl: [flag, string, { call: [<.args.get, idx] }]
+                  - set: [idx, { +: [idx, 1] }]
+                  - if:
+                      condition: { eq: [{ call: [flag.starts_with, "--"] }, 1] }
+                      then:
+                        - if: { condition: { ge: [idx, <.args.len] }, then: [{ return: ["${flag} needs a value"] }] }
+                        - decl: [value, string, { call: [<.args.get, idx] }]
+                        - set: [idx, { +: [idx, 1] }]
+                        - decl: [known, i32, 1]
+                        - if: { condition: { eq: [flag, "--ref"] }, then: [{ set: [<.ref_name, value] }], else: [
+                            { if: { condition: { eq: [flag, "--arch"] }, then: [{ set: [<.arch, value] }], else: [
+                              { if: { condition: { eq: [flag, "--registry"] }, then: [{ set: [<.registry, value] }], else: [
+                                { if: { condition: { eq: [flag, "--root"] }, then: [{ set: [<.root, value] }], else: [
+                                  { if: { condition: { eq: [flag, "--artifact-type"] }, then: [{ set: [<.artifact_type, value] }], else: [
+                                    { if: { condition: { eq: [flag, "--pipeline"] }, then: [{ set: [<.pipeline, value] }], else: [{ set: [known, 0] }] } }
+                                  ] } }
+                                ] } }
+                              ] } }
+                            ] } }
+                          ] }
+                        - if: { condition: { eq: [known, 0] }, then: [{ return: ["unknown option ${flag}"] }] }
+                      else:
+                        - call: [<.words.push, flag]
+            - return: [""]
+
+      # The kit for this command — the only place a concrete kit is named.
+      - def:
+          name: kit
+          return: ptr<ufo.kit.LayerKit>
+          body:
+            - if:
+                condition: { gt: [<.registry.len, 0] }
+                then:
+                  - decl: [envm, map<string:string>, { call: [sys.env] }]
+                  - decl: [token, string, ""]
+                  - if: { condition: { eq: [{ call: [envm.contains, "UFO_REGISTRY_TOKEN"] }, 1] }, then: [{ set: [token, { call: [envm.get, "UFO_REGISTRY_TOKEN"] }] }] }
+                  - decl: [remote, ptr<ufo.kit.LayerKit>, { new: ufo.kit.MuseumKit, url: <.registry, token: token, git_dir: <.git_dir, work_dir: <.work }]
+                  - return: [remote]
+            - decl: [local, ptr<ufo.kit.LayerKit>, { new: ufo.kit.LayoutKit, root: <.root, git_dir: <.git_dir, work_dir: <.work }]
+            - return: [local]
+
+      - def:
+          name: run
+          static_off: ["str_cmp"]
+          args: [[pos, i32]]
+          return: i32
+          body:
+            - decl: [sub, string, ""]
+            - if: { condition: { lt: [pos, <.args.len] }, then: [{ set: [sub, { call: [<.args.get, pos] }] }] }
+            - decl: [err, string, { call: [<.parse, { +: [pos, 1] }] }]
+            - if: { condition: { gt: [err.len, 0] }, then: [{ return: [{ call: [<.fail, err] }] }] }
+            # scratch space for temp tars/blobs, removed afterwards
+            - decl: [envm, map<string:string>, { call: [sys.env] }]
+            - decl: [tmp_root, string, "/tmp"]
+            - if: { condition: { eq: [{ call: [envm.contains, "TMPDIR"] }, 1] }, then: [{ set: [tmp_root, { call: [envm.get, "TMPDIR"] }] }] }
+            - set: [<.work, "${tmp_root}/ufo-kit-${{ call: [math.random_hex, 8] }}"]
+            - decl: [res, i32, { call: [<.dispatch, sub] }]
+            - call: [io.remove_all, <.work]
+            - return: [res]
+
+      - def:
+          name: dispatch
+          static_off: ["str_cmp"]
+          args: [[sub, string]]
+          return: i32
+          body:
+            - decl: [one, string, { call: [<.word, 0] }]
+            - decl: [two, string, { call: [<.word, 1] }]
+            - decl: [arch, string, <.arch]
+            - if: { condition: { eq: [arch.len, 0] }, then: [{ set: [arch, "amd64"] }] }
+            - if: { condition: { and: [{ neq: [sub, "record"] }, { neq: [<.words.len, 2] }] }, then: [{ return: [{ call: [<.fail, "usage: ufo image (export-layers|export-dir|import|push|pull) <a> <b> [options]; ufo image record <layout> --pipeline <p>"] }] }] }
+            - decl: [kit, ptr<ufo.kit.LayerKit>, { call: [<.kit] }]
+            - if: { condition: { eq: [sub, "export-layers"] }, then: [{ return: [{ call: [kit.images.export_layers, one, two, <.ref_name, arch] }] }] }
+            - if: { condition: { eq: [sub, "export-dir"] }, then: [{ return: [{ call: [kit.images.export_dir, one, two, <.ref_name, arch] }] }] }
+            # import: the given arch, else whatever the image is for
+            - if: { condition: { eq: [sub, "import"] }, then: [{ return: [{ call: [kit.images.import_image, one, two, <.arch] }] }] }
+            - if:
+                condition: { or: [{ eq: [sub, "push"] }, { eq: [sub, "pull"] }] }
+                then:
+                  - if: { condition: { and: [{ eq: [<.registry.len, 0] }, { eq: [<.root.len, 0] }] }, then: [{ return: [{ call: [<.fail, "${sub}: --registry <url> or --root <dir>"] }] }] }
+                  - decl: [digest, string, ""]
+                  - if: { condition: { eq: [sub, "push"] }, then: [{ set: [digest, { call: [kit.registry.push, one, two, <.artifact_type] }] }], else: [{ set: [digest, { call: [kit.registry.pull, one, two] }] }] }
+                  - if: { condition: { eq: [digest.len, 0] }, then: [{ return: [1] }] }
+                  - print: ["${digest}"]
+                  - return: [0]
+            - if:
+                condition: { eq: [sub, "record"] }
+                then:
+                  - if: { condition: { or: [{ neq: [<.words.len, 1] }, { eq: [<.pipeline.len, 0] }] }, then: [{ return: [{ call: [<.fail, "usage: ufo [-C <git-dir>] image record <layout> --pipeline <p>"] }] }] }
+                  - decl: [count, i32, { call: [kit.history.record, one, <.pipeline] }]
+                  - if: { condition: { lt: [count, 0] }, then: [{ return: [1] }] }
+                  - print: ["${count}"]
+                  - return: [0]
+            - return: [{ call: [<.fail, "unknown subcommand '${sub}'"] }]

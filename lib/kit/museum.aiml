@@ -1,0 +1,18 @@
+# ufo.kit.MuseumKit — the layer kit against an OCI distribution registry over
+# HTTP (museum's /v2/, doc/kit.md §1).  `token` = Bearer token, "" = anonymous.
+- namespace: ufo.kit
+
+- import: "api.aiml"
+- import: "images.aiml"
+- import: "registry_http.aiml"
+- import: "history.aiml"
+
+- classgroup:
+    name: MuseumKit
+    implements: [ufo.kit.LayerKit]
+    params: [[url, string], [token, string], [git_dir, string], [work_dir, string]]
+    instances:
+      - { class: ufo.kit.OciImages, instance: images, constructor: [setup, work_dir] }
+      - { class: ufo.kit.HttpRegistry, instance: registry, constructor: [setup, url, token, work_dir] }
+      - { class: ufo.kit.LayerHistory, instance: history, constructor: [setup, git_dir, work_dir] }
+    export: [images, registry, history]

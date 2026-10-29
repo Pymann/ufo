@@ -1,0 +1,26 @@
+# ufo.identity — who writes commits.
+- namespace: ufo.identity
+
+- import: "object.aiml"
+
+# "Name <mail> <seconds> +0000" from UFO_/GIT_<ROLE>_NAME/EMAIL, else ufo defaults.
+- def:
+    name: current
+    args: [[role, string]]
+    return: string
+    body:
+      - decl: [envm, map<string:string>, { call: [sys.env] }]
+      - decl: [who, string, "ufo"]
+      - decl: [mail, string, "ufo@localhost"]
+      - if: { condition: { eq: [{ call: [envm.contains, "GIT_${role}_NAME"] }, 1] }, then: [{ set: [who, { call: [envm.get, "GIT_${role}_NAME"] }] }] }
+      - if: { condition: { eq: [{ call: [envm.contains, "GIT_${role}_EMAIL"] }, 1] }, then: [{ set: [mail, { call: [envm.get, "GIT_${role}_EMAIL"] }] }] }
+      - decl: [seconds, i64, { '/': [{ call: [time.now] }, 1000] }]
+      - if:
+          condition: { eq: [{ call: [envm.contains, "GIT_${role}_DATE"] }, 1] }
+          then:
+            # only "<seconds> +0000" is understood here
+            - decl: [stamp, string, { call: [envm.get, "GIT_${role}_DATE"] }]
+            - decl: [parts, list<string>, { call: [stamp.split, " "] }]
+            - decl: [secs_txt, string, { call: [parts.get, 0] }]
+            - set: [seconds, { call: [secs_txt.to_int] }]
+      - return: [{ call: [ufo.object.signature, who, mail, seconds] }]

@@ -1,0 +1,96 @@
+# ufo.kit.Reference — `<repository>:<tag>` / `<repository>@sha256:<hex>`
+# (doc/kit.md §3).  Validated strictly, because both registries build paths
+# from it: repository = lowercase path components [a-z0-9._-] (no `.`/`..`),
+# tag = [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}, digest = sha256 + 64 hex.
+- namespace: ufo.kit
+
+- class:
+    name: Reference
+    members:
+      - [repo, string, "", { access: public }]
+      - [tag, string, "", { access: public }]      # "" for a digest reference
+      - [digest, string, "", { access: public }]   # "sha256:<hex>" or ""
+      - [error, string, "", { access: public }]
+    methods:
+      # The manifest path element: the tag or the digest.
+      - def:
+          name: target
+          return: string
+          body:
+            - if: { condition: { gt: [<.digest.len, 0] }, then: [{ return: [<.digest] }] }
+            - return: [<.tag]
+
+      # 1 when every byte of `text` is in `allowed`.
+      - def:
+          name: only
+          args: [[text, string], [allowed, string]]
+          return: i32
+          body:
+            - decl: [raw, buffer<u8>, { call: [bytes.from_string, text] }]
+            - decl: [set_raw, buffer<u8>, { call: [bytes.from_string, allowed] }]
+            - decl: [idx, i32, 0]
+            - while:
+                condition: { lt: [idx, raw.len] }
+                body:
+                  - if: { condition: { lt: [{ call: [bytes.find, set_raw, { call: [bytes.u8, raw, idx] }, 0] }, 0] }, then: [{ return: [0] }] }
+                  - set: [idx, { +: [idx, 1] }]
+            - return: [1]
+
+      - def:
+          name: bad
+          args: [[message, string]]
+          return: i32
+          body:
+            - set: [<.error, message]
+            - return: [1]
+
+      # 0 = parsed, 1 = invalid (error set).
+      - def:
+          name: parse
+          static_off: ["str_cmp"]
+          args: [[text, string]]
+          return: i32
+          body:
+            - decl: [lower, string, "abcdefghijklmnopqrstuvwxyz0123456789._-"]
+            - decl: [hexd, string, "0123456789abcdef"]
+            - decl: [name, string, text]
+            - decl: [at_pos, i32, { call: [text.index_of, "@"] }]
+            - if:
+                condition: { ge: [at_pos, 0] }
+                then:
+                  - set: [name, { call: [text.substr, 0, at_pos] }]
+                  - set: [<.digest, { call: [text.substr, { +: [at_pos, 1] }] }]
+                  - if: { condition: { eq: [{ call: [<.digest.starts_with, "sha256:"] }, 0] }, then: [{ return: [{ call: [<.bad, "${text}: only sha256 digests are supported"] }] }] }
+                  - decl: [hex, string, { call: [<.digest.substr, 7] }]
+                  - if: { condition: { or: [{ neq: [hex.len, 64] }, { eq: [{ call: [<.only, hex, hexd] }, 0] }] }, then: [{ return: [{ call: [<.bad, "${text}: malformed digest"] }] }] }
+                else:
+                  # the tag follows the last ':' after the last '/'
+                  - decl: [slash, i32, -1]
+                  - decl: [colon, i32, -1]
+                  - decl: [raw, buffer<u8>, { call: [bytes.from_string, text] }]
+                  - decl: [idx, i32, 0]
+                  - while:
+                      condition: { lt: [idx, raw.len] }
+                      body:
+                        - decl: [chr, i32, { call: [bytes.u8, raw, idx] }]
+                        - if: { condition: { eq: [chr, 47] }, then: [{ set: [slash, idx] }] }
+                        - if: { condition: { eq: [chr, 58] }, then: [{ set: [colon, idx] }] }
+                        - set: [idx, { +: [idx, 1] }]
+                  - if: { condition: { le: [colon, slash] }, then: [{ return: [{ call: [<.bad, "${text}: a reference needs :<tag> or @sha256:<digest>"] }] }] }
+                  - set: [name, { call: [text.substr, 0, colon] }]
+                  - set: [<.tag, { call: [text.substr, { +: [colon, 1] }] }]
+                  - if: { condition: { or: [{ eq: [<.tag.len, 0] }, { gt: [<.tag.len, 128] }] }, then: [{ return: [{ call: [<.bad, "${text}: invalid tag"] }] }] }
+                  - if: { condition: { eq: [{ call: [<.only, <.tag, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"] }, 0] }, then: [{ return: [{ call: [<.bad, "${text}: invalid tag"] }] }] }
+                  - if: { condition: { or: [{ eq: [{ call: [<.tag.starts_with, "."] }, 1] }, { eq: [{ call: [<.tag.starts_with, "-"] }, 1] }] }, then: [{ return: [{ call: [<.bad, "${text}: invalid tag"] }] }] }
+            - if: { condition: { eq: [name.len, 0] }, then: [{ return: [{ call: [<.bad, "${text}: no repository"] }] }] }
+            - decl: [parts, list<string>, { call: [name.split, "/"] }]
+            - decl: [pdx, i32, 0]
+            - while:
+                condition: { lt: [pdx, parts.len] }
+                body:
+                  - decl: [part, string, { call: [parts.get, pdx] }]
+                  - set: [pdx, { +: [pdx, 1] }]
+                  - if: { condition: { or: [{ eq: [part.len, 0] }, { or: [{ eq: [part, "."] }, { eq: [part, ".."] }] }] }, then: [{ return: [{ call: [<.bad, "${text}: invalid repository"] }] }] }
+                  - if: { condition: { eq: [{ call: [<.only, part, lower] }, 0] }, then: [{ return: [{ call: [<.bad, "${text}: invalid repository (lowercase a-z 0-9 . _ - /)"] }] }] }
+            - set: [<.repo, name]
+            - return: [0]

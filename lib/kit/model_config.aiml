@@ -1,0 +1,11 @@
+# OCI image config, as READ by ufo.kit (only what import needs).
+- namespace: ufo.kit
+
+- import: "model_image.aiml"
+
+- model:
+    name: KitImgCfg
+    fields:
+      - [architecture, string, ""]
+      - [osname, string, "", { alias: "os" }]
+      - [rootfs, ufo.kit.KitRootfs]
