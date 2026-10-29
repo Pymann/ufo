@@ -1,7 +1,7 @@
 #!/bin/bash
-# The aiml venv as a layer (aiml spec/69 §5): a stage creates it in its root, the upper
+# The aiml venv as a layer (aiml spec/68 §5): a stage creates it in its root, the upper
 # directory goes in as a layer, and `ufo layer apply` gives back a venv that works where it
-# lands — after `aiml venv` there rewrote its env (F69-14).
+# lands — after `aiml venv` there rewrote its env (F68-14).
 #   UFO=./ufo AIML=<build-tree or venv aiml> tests/venv_layer.sh
 set -u
 cd "$(dirname "$0")/.."
