@@ -157,6 +157,7 @@ AIML_MEM_V3=1 aiml ufo.aiml -- <command> …   # without building (JIT)
 UFO=./ufo tests/interop.sh   # object store / packs against git (18 checks)
 UFO=./ufo tests/remote.sh    # smart HTTP against git http-backend (26 checks)
 UFO=./ufo tests/layer.sh     # layers against a real overlayfs mount (33 checks; root)
+UFO=./ufo AIML=aiml tests/venv_layer.sh   # the aiml venv (aiml spec/68) as a layer and back (8 checks)
 AIML_MEM_V3=1 aiml tests/test_object.aiml
 AIML_BIN=aiml KONTOR_DIR=../kontor tests/package.sh   # package → kontor → download → run
 UFO=./ufo tests/kit.sh       # images: export/import/registry/history (39 checks with cosmos; root)
