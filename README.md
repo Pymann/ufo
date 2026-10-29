@@ -141,9 +141,9 @@ with two implementations, `ufo.kit.MuseumKit` and `ufo.kit.LayoutKit`.
 ufo needs an aiml compiler with the `bytes`, `hash.sha1` and `fsmeta`
 builtins and method calls on `shared<Class>` — aiml `mem-v3-compiler` from 34c3340 on
 (feature/git-support-memv3 and fix/shared-method-call-memv3 are merged there) — and memV3
-(`AIML_MEM_V3=1`). `ufo image` additionally needs classgroup interfaces and the
-file-streaming `bytes` builtins (aiml feature/stream-bytes, with its fixes for
-namespaced classes/classgroups and the HTTP client).
+(`AIML_MEM_V3=1`). `ufo image` additionally needs classgroup interfaces, the
+file-streaming `bytes` builtins and the fixes for namespaced classes/classgroups
+and the HTTP client — aiml `mem-v3-compiler` from 58efe0c on.
 
 ```
 exodus build                      # ./ufo, with ../aiml as in exodus.json
