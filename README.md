@@ -192,8 +192,16 @@ KONTOR_URL=https://kontor.example.org KONTOR_TOKEN=… scripts/publish.sh
 #  PUT /exodus/ufo/<version>/package
 ```
 
-Consumers download `/exodus/ufo/<version>/package` and unpack it. They can
-then run `exodus build` in `ufo-<version>/`, or import the modules
+An aiml venv does the consumer side in one step — download, unpack, build with
+its own compiler, place `bin/ufo` and register `@ufo` (aiml spec/68 §6.1):
+
+```
+aiml venv /path/to/venv install ufo --kontor https://kontor.example.org
+aiml venv /path/to/venv install --all --kontor https://kontor.example.org
+```
+
+By hand it is the same two files: download `/exodus/ufo/<version>/package` and
+unpack it. You can then run `exodus build` in `ufo-<version>/`, or import the modules
 (`lib/repo.aiml`, `lib/pack.aiml`, `lib/remote.aiml`, `lib/layer.aiml`, …;
 namespaces `ufo.*`) into their own aiml project.
 
