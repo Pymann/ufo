@@ -14,7 +14,7 @@ pass() { PASSES=$((PASSES + 1)); echo "  ok   $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  FAIL $1"; }
 check() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1: got '$2' want '$3'"; fi; }
 [ -f "$KONTOR_DIR/kontor.aiml" ] || { echo "SKIP: no kontor at $KONTOR_DIR"; exit 0; }
-VERSION="$(python3 -c 'import json; print(json.load(open("exodus.json"))["version"])')"
+VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' exodus.json | head -1)"
 
 A="$(scripts/package.sh "$WORK/a")"; B="$(scripts/package.sh "$WORK/b")"
 check "archive is reproducible" "$(cmp -s "$A" "$B" && echo same)" "same"
@@ -30,7 +30,7 @@ for _ in $(seq 150); do curl -s -o /dev/null "http://127.0.0.1:$PORT/api/health"
 KONTOR_URL="http://127.0.0.1:$PORT" KONTOR_TOKEN="$TOKEN" OUT="$WORK/pub" scripts/publish.sh > "$WORK/publish.log" 2>&1
 check "publish" "$?" "0"
 check "token not echoed" "$(grep -c "$TOKEN" "$WORK/publish.log")" "0"
-check "manifest from kontor" "$(curl -s "http://127.0.0.1:$PORT/exodus/ufo/$VERSION/exodus.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')" "ufo"
+check "manifest from kontor" "$(curl -s "http://127.0.0.1:$PORT/exodus/ufo/$VERSION/exodus.json" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' | head -1)" "ufo"
 curl -s -o "$WORK/dl.tar.gz" "http://127.0.0.1:$PORT/exodus/ufo/$VERSION/package"
 check "package bytes" "$(sha256sum < "$WORK/dl.tar.gz")" "$(sha256sum < "$A")"
 mkdir -p "$WORK/consumer" && tar xzf "$WORK/dl.tar.gz" -C "$WORK/consumer"

@@ -145,10 +145,23 @@ builtins and method calls on `shared<Class>` — aiml `mem-v3-compiler` from 34c
 file-streaming `bytes` builtins and the fixes for namespaced classes/classgroups
 and the HTTP client — aiml `mem-v3-compiler` from 58efe0c on.
 
+`exodus.json` takes its compiler from `$AIML` and the runtime from
+`$AIML_VENV/lib` (aiml spec/68 F68-23), so a venv has to be active — ufo is
+built by the compiler it will live next to, not by a path into somebody's
+build tree:
+
 ```
-exodus build                      # ./ufo, with ../aiml as in exodus.json
-exodus build -c exodus.local.json # an untracked config pointing at your own aiml build
+. /path/to/venv/env               # aiml venv /path/to/venv  (aiml spec/68)
+exodus build                      # ./ufo, linked against $AIML_VENV/lib
 AIML_MEM_V3=1 aiml ufo.aiml -- <command> …   # without building (JIT)
+```
+
+`aiml.tool.json` says what an install places, so the venv can do all of it
+in one step — clone, build with its own compiler, put `ufo` in `bin/` and
+register `lib/` as the importable package `@ufo`:
+
+```
+aiml venv /path/to/venv install ufo --git https://github.com/Pymann/ufo
 ```
 
 ## Tests

@@ -8,7 +8,7 @@ set -eu
 cd "$(dirname "$0")/.."
 : "${KONTOR_URL:?set KONTOR_URL}"
 : "${KONTOR_TOKEN:?set KONTOR_TOKEN (a kontor token with the writer role)}"
-VERSION="$(python3 -c 'import json; print(json.load(open("exodus.json"))["version"])')"
+VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' exodus.json | head -1)"
 PKG="$(scripts/package.sh "${OUT:-out}")"
 HDR="$(mktemp)"; trap 'rm -f "$HDR"' EXIT
 chmod 600 "$HDR"; printf 'Authorization: Bearer %s\n' "$KONTOR_TOKEN" > "$HDR"

@@ -1,0 +1,7 @@
+{
+    "$schema": "aiml.tool-1.0",
+    "name": "ufo",
+    "version": "0.1.0",
+    "programs": ["ufo"],
+    "package": "."
+}

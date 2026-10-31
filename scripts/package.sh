@@ -9,7 +9,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 OUT="${1:-out}"
-VERSION="$(python3 -c 'import json; print(json.load(open("exodus.json"))["version"])')"
+VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' exodus.json | head -1)"
 NAME="ufo-$VERSION"
 mkdir -p "$OUT"
 STAGE="$(mktemp -d)"

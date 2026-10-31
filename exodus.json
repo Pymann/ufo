@@ -10,14 +10,14 @@
         "ufo.aiml"
     ],
     "compiler": {
-        "name": "../aiml/out/aiml/aiml",
+        "name": "$AIML",
         "lang_standard": "17",
         "flags": []
     },
     "linker": {
         "name": "g++",
         "flags": [
-            "-Wl,-rpath,../aiml/out/libaiml"
+            "-Wl,-rpath,$ORIGIN/../lib"
         ],
         "libraries": [
             "aiml",
@@ -27,7 +27,7 @@
             "dl"
         ],
         "library_paths": [
-            "../aiml/out/libaiml"
+            "$AIML_VENV/lib"
         ]
     },
     "artifact_in_cwd": true,
